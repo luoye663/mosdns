@@ -1,0 +1,4 @@
+.git/
+mosdns
+**/*.db
+**/*.dump

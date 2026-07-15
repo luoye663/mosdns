@@ -1,12 +1,14 @@
-FROM golang:latest as builder
-ARG CGO_ENABLED=0
+FROM golang:1.26-alpine AS builder
+WORKDIR /src
+COPY . .
+ARG PROJECT_VERSION=dev
+ARG GIT_COMMIT=unknown
+ARG BUILD_TIME=unknown
+ARG MOSDNS_BASE=v5.3.4
+RUN CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X main.projectVersion=${PROJECT_VERSION} -X main.gitCommit=${GIT_COMMIT} -X main.mosdnsBase=${MOSDNS_BASE} -X main.buildTime=${BUILD_TIME} -X github.com/IrineSistiana/mosdns/v5/plugin/executable/dynamic_rule_engine.Version=${PROJECT_VERSION} -X github.com/IrineSistiana/mosdns/v5/plugin/executable/query_audit.Version=${PROJECT_VERSION}" -o /out/mosdns ./
 
-COPY ./ /root/src/
-WORKDIR /root/src/
-RUN go build -ldflags "-s -w -X main.version=$(git describe --tags --long --always)" -trimpath -o mosdns
-
-FROM alpine:latest
-
-COPY --from=builder /root/src/mosdns /usr/bin/
-
-RUN apk add --no-cache ca-certificates
+FROM alpine:3.22
+RUN apk add --no-cache ca-certificates && addgroup -S mosdns && adduser -S -G mosdns -u 10001 mosdns && mkdir -p /var/lib/mosdns && chown -R mosdns:mosdns /var/lib/mosdns
+COPY --from=builder /out/mosdns /usr/local/bin/mosdns
+USER mosdns
+ENTRYPOINT ["/usr/local/bin/mosdns"]

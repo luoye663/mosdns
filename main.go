@@ -30,7 +30,10 @@ import (
 )
 
 var (
-	version = "dev/unknown"
+	projectVersion = "dev"
+	gitCommit      = "unknown"
+	mosdnsBase     = "v5.3.4"
+	buildTime      = "unknown"
 )
 
 func init() {
@@ -38,7 +41,8 @@ func init() {
 		Use:   "version",
 		Short: "Print out version info and exit.",
 		Run: func(cmd *cobra.Command, args []string) {
-			fmt.Println(version)
+			// 构建信息用于运行期核对，不能包含规则、token 或上游地址。
+			fmt.Printf("version=%s commit=%s mosdns_base=%s build_time=%s\n", projectVersion, gitCommit, mosdnsBase, buildTime)
 		},
 	})
 }
