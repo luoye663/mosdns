@@ -33,6 +33,7 @@ type Args struct {
 // Plugin 会在 Phase 2 持有不可变快照指针。
 type Plugin struct {
 	closed atomic.Bool
+	store  Store
 }
 
 var (
