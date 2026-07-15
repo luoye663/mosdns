@@ -48,6 +48,7 @@ import (
 	_ "github.com/IrineSistiana/mosdns/v5/plugin/executable/drop_resp"
 	_ "github.com/IrineSistiana/mosdns/v5/plugin/executable/dual_selector"
 	_ "github.com/IrineSistiana/mosdns/v5/plugin/executable/dynamic_rule_engine"
+	_ "github.com/IrineSistiana/mosdns/v5/plugin/executable/dynamic_forward"
 	_ "github.com/IrineSistiana/mosdns/v5/plugin/executable/ecs_handler"
 	_ "github.com/IrineSistiana/mosdns/v5/plugin/executable/forward"
 	_ "github.com/IrineSistiana/mosdns/v5/plugin/executable/forward_edns0opt"
