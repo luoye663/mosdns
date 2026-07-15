@@ -83,3 +83,15 @@ type MatchResult struct {
 	Route           MatchedRule
 	Logging         MatchedRule
 }
+
+// RuntimeDecision 是绑定到单个 DNS 请求生命周期的只读决策信息。
+// query_audit 在后置阶段读取它，不能在写入后修改。
+type RuntimeDecision struct {
+	SnapshotVersion uint64
+	AccessRuleID    int64
+	RouteRuleID     int64
+	LoggingRuleID   int64
+	AccessAction    string
+	RouteAction     string
+	RouteSource     string
+}

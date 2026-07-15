@@ -10,6 +10,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"github.com/IrineSistiana/mosdns/v5/pkg/matcher/domain"
@@ -31,6 +32,7 @@ type CompiledSnapshot struct {
 	blockRCode    int
 	ruleCount     int
 	regexpCount   int
+	loadedAt      time.Time
 
 	full   [categoryCount]map[string]MatchedRule
 	domain [categoryCount]*domain.SubDomainMatcher[MatchedRule]
@@ -43,6 +45,7 @@ func (s *CompiledSnapshot) Checksum() string      { return s.checksum }
 func (s *CompiledSnapshot) BlockRCode() int       { return s.blockRCode }
 func (s *CompiledSnapshot) RuleCount() int        { return s.ruleCount }
 func (s *CompiledSnapshot) RegexpRuleCount() int  { return s.regexpCount }
+func (s *CompiledSnapshot) LoadedAt() time.Time   { return s.loadedAt }
 
 // Compile 在 DNS 请求路径外执行全部校验和索引构建。
 func Compile(snapshot Snapshot, limits Limits) (*CompiledSnapshot, error) {
@@ -99,6 +102,7 @@ func Compile(snapshot Snapshot, limits Limits) (*CompiledSnapshot, error) {
 		blockRCode:    snapshot.BlockRCode,
 		ruleCount:     len(canonicalRules),
 		regexpCount:   regexpCount,
+		loadedAt:      time.Now().UTC(),
 	}
 	for i := range compiled.full {
 		compiled.full[i] = make(map[string]MatchedRule)
