@@ -76,3 +76,23 @@ func TestSnapshotAPIRejectsUnauthorizedAndStaleUpdate(t *testing.T) {
 		}
 	}
 }
+
+func TestCanonicalSnapshotDefaultsAndValidatesScheduling(t *testing.T) {
+	snapshot, err := canonical(Snapshot{Version: 1, Concurrent: 1, Upstreams: []Upstream{{Tag: "first", Addr: "https://dns.example/dns-query"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.Mode != "race" || snapshot.Upstreams[0].Priority != 100 || snapshot.Upstreams[0].Weight != 1 {
+		t.Fatalf("defaults=%+v", snapshot)
+	}
+	if _, err := canonical(Snapshot{Version: 1, Mode: "unknown", Concurrent: 1, Upstreams: snapshot.Upstreams}); err == nil {
+		t.Fatal("invalid mode was accepted")
+	}
+}
+
+func TestPriorityLevelsSortAscending(t *testing.T) {
+	levels := priorityLevels([]Upstream{{Tag: "backup", Priority: 200}, {Tag: "primary-a", Priority: 100}, {Tag: "primary-b", Priority: 100}})
+	if len(levels) != 2 || len(levels[0]) != 2 || levels[0][0] != "primary-a" || levels[1][0] != "backup" {
+		t.Fatalf("levels=%v", levels)
+	}
+}

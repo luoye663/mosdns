@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"net/http"
 	"net/url"
 	"os"
@@ -24,6 +25,7 @@ import (
 	fastforward "github.com/IrineSistiana/mosdns/v5/plugin/executable/forward"
 	"github.com/IrineSistiana/mosdns/v5/plugin/executable/sequence"
 	"github.com/go-chi/chi/v5"
+	"github.com/miekg/dns"
 	"go.uber.org/zap"
 )
 
@@ -42,6 +44,7 @@ type Args struct {
 type Snapshot struct {
 	Version                uint64     `json:"version" yaml:"version"`
 	ExpectedCurrentVersion uint64     `json:"expected_current_version" yaml:"expected_current_version"`
+	Mode                   string     `json:"mode" yaml:"mode"`
 	Concurrent             int        `json:"concurrent" yaml:"concurrent"`
 	Socks5                 string     `json:"socks5,omitempty" yaml:"socks5"`
 	Upstreams              []Upstream `json:"upstreams" yaml:"upstreams"`
@@ -49,15 +52,19 @@ type Snapshot struct {
 }
 
 type Upstream struct {
-	Tag  string `json:"tag" yaml:"tag"`
-	Addr string `json:"addr" yaml:"addr"`
+	Tag      string `json:"tag" yaml:"tag"`
+	Addr     string `json:"addr" yaml:"addr"`
+	Priority int    `json:"priority" yaml:"priority"`
+	Weight   int    `json:"weight" yaml:"weight"`
 }
 
 type runtimeForward struct {
-	forward *fastforward.Forward
-	refs    atomic.Int64
-	retired atomic.Bool
-	closed  atomic.Bool
+	forward  *fastforward.Forward
+	refs     atomic.Int64
+	retired  atomic.Bool
+	closed   atomic.Bool
+	snapshot Snapshot
+	levels   [][]string
 }
 
 func (r *runtimeForward) retire() {
@@ -158,7 +165,7 @@ func (p *Plugin) install(snapshot Snapshot, persist bool) error {
 			return err
 		}
 	}
-	next := &runtimeForward{forward: forward}
+	next := &runtimeForward{forward: forward, snapshot: canonical, levels: priorityLevels(canonical.Upstreams)}
 	old := p.current.Swap(next)
 	p.snapshot.Store(&canonical)
 	if old != nil {
@@ -182,6 +189,12 @@ func canonical(snapshot Snapshot) (Snapshot, error) {
 	if snapshot.Concurrent < 1 || snapshot.Concurrent > 3 {
 		return Snapshot{}, errors.New("concurrent must be within 1..3")
 	}
+	if snapshot.Mode == "" {
+		snapshot.Mode = "race"
+	}
+	if snapshot.Mode != "race" && snapshot.Mode != "weighted" && snapshot.Mode != "failover" {
+		return Snapshot{}, errors.New("mode must be race, weighted or failover")
+	}
 	if len(snapshot.Upstreams) == 0 || len(snapshot.Upstreams) > 16 {
 		return Snapshot{}, errors.New("upstreams must contain 1..16 entries")
 	}
@@ -189,6 +202,18 @@ func canonical(snapshot Snapshot) (Snapshot, error) {
 	for i := range snapshot.Upstreams {
 		item := &snapshot.Upstreams[i]
 		item.Tag, item.Addr = strings.TrimSpace(item.Tag), strings.TrimSpace(item.Addr)
+		if item.Priority == 0 {
+			item.Priority = 100
+		}
+		if item.Weight == 0 {
+			item.Weight = 1
+		}
+		if item.Priority < 1 || item.Priority > 1000 {
+			return Snapshot{}, fmt.Errorf("upstream %d priority must be within 1..1000", i+1)
+		}
+		if item.Weight < 1 || item.Weight > 100 {
+			return Snapshot{}, fmt.Errorf("upstream %d weight must be within 1..100", i+1)
+		}
 		if !tagPattern.MatchString(item.Tag) {
 			return Snapshot{}, fmt.Errorf("upstream %d has an invalid tag", i+1)
 		}
@@ -216,6 +241,50 @@ func canonical(snapshot Snapshot) (Snapshot, error) {
 	digest := sha256.Sum256(data)
 	snapshot.Checksum = "sha256:" + hex.EncodeToString(digest[:])
 	return snapshot, nil
+}
+
+func priorityLevels(upstreams []Upstream) [][]string {
+	byPriority := make(map[int][]string)
+	priorities := make([]int, 0, len(upstreams))
+	for _, upstream := range upstreams {
+		if _, exists := byPriority[upstream.Priority]; !exists {
+			priorities = append(priorities, upstream.Priority)
+		}
+		byPriority[upstream.Priority] = append(byPriority[upstream.Priority], upstream.Tag)
+	}
+	for i := 0; i < len(priorities); i++ {
+		for j := i + 1; j < len(priorities); j++ {
+			if priorities[j] < priorities[i] {
+				priorities[i], priorities[j] = priorities[j], priorities[i]
+			}
+		}
+	}
+	levels := make([][]string, 0, len(priorities))
+	for _, priority := range priorities {
+		levels = append(levels, byPriority[priority])
+	}
+	return levels
+}
+
+func weightedTags(upstreams []Upstream, count int) []string {
+	available := append([]Upstream(nil), upstreams...)
+	selected := make([]string, 0, count)
+	for len(available) > 0 && len(selected) < count {
+		total := 0
+		for _, upstream := range available {
+			total += upstream.Weight
+		}
+		choice := rand.IntN(total)
+		for index, upstream := range available {
+			choice -= upstream.Weight
+			if choice < 0 {
+				selected = append(selected, upstream.Tag)
+				available = append(available[:index], available[index+1:]...)
+				break
+			}
+		}
+	}
+	return selected
 }
 
 func (p *Plugin) acquire() (*runtimeForward, error) {
@@ -246,7 +315,25 @@ func (p *Plugin) Exec(ctx context.Context, qCtx *query_context.Context) error {
 		return err
 	}
 	defer p.release(current)
-	return current.forward.Exec(ctx, qCtx)
+	switch current.snapshot.Mode {
+	case "weighted":
+		return current.forward.ExecWithTags(ctx, qCtx, weightedTags(current.snapshot.Upstreams, current.snapshot.Concurrent))
+	case "failover":
+		var lastErr error
+		for _, level := range current.levels {
+			err := current.forward.ExecWithTags(ctx, qCtx, level)
+			if err != nil {
+				lastErr = err
+				continue
+			}
+			if response := qCtx.R(); response == nil || response.Rcode != dns.RcodeServerFailure {
+				return nil
+			}
+		}
+		return lastErr
+	default:
+		return current.forward.Exec(ctx, qCtx)
+	}
 }
 
 func (p *Plugin) Close() error {

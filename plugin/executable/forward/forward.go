@@ -206,6 +206,28 @@ func (f *Forward) Exec(ctx context.Context, qCtx *query_context.Context) (err er
 	return nil
 }
 
+// ExecWithTags forwards only to the requested upstream tags. It is used by
+// dynamic forwarding policies after their candidate set is chosen off-path.
+func (f *Forward) ExecWithTags(ctx context.Context, qCtx *query_context.Context, tags []string) error {
+	if len(tags) == 0 {
+		return errors.New("no upstream tags selected")
+	}
+	us := make([]*upstreamWrapper, 0, len(tags))
+	for _, tag := range tags {
+		u := f.tag2Upstream[tag]
+		if u == nil {
+			return fmt.Errorf("cannot find upstream by tag %s", tag)
+		}
+		us = append(us, u)
+	}
+	r, err := f.exchange(ctx, qCtx, us)
+	if err != nil {
+		return err
+	}
+	qCtx.SetResponse(r)
+	return nil
+}
+
 // QuickConfigureExec format: [upstream_tag]...
 func (f *Forward) QuickConfigureExec(args string) (any, error) {
 	var us []*upstreamWrapper
