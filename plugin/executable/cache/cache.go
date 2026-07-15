@@ -23,6 +23,7 @@ import (
 	"context"
 	"crypto/subtle"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -93,6 +94,7 @@ type Cache struct {
 	closeOnce    sync.Once
 	closeNotify  chan struct{}
 	updatedKey   atomic.Uint64
+	enabled      atomic.Bool
 	controlToken []byte
 
 	queryTotal   prometheus.Counter
@@ -186,6 +188,7 @@ func NewCache(args *Args, opts Opts) *Cache {
 			return float64(backend.Len())
 		}),
 	}
+	p.enabled.Store(true)
 
 	if err := p.loadDump(); err != nil {
 		p.logger.Error("failed to load cache dump", zap.Error(err))
@@ -205,6 +208,9 @@ func (c *Cache) RegMetricsTo(r prometheus.Registerer) error {
 }
 
 func (c *Cache) Exec(ctx context.Context, qCtx *query_context.Context, next sequence.ChainWalker) error {
+	if !c.enabled.Load() {
+		return next.ExecNext(ctx, qCtx)
+	}
 	c.queryTotal.Inc()
 	q := qCtx.Q()
 
@@ -340,6 +346,31 @@ func (c *Cache) Api() *chi.Mux {
 	r.Use(c.requireControlToken)
 	r.Get("/flush", func(w http.ResponseWriter, req *http.Request) {
 		c.backend.Flush()
+	})
+	r.Get("/status", func(w http.ResponseWriter, req *http.Request) {
+		w.Header().Set("content-type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]bool{"enabled": c.enabled.Load()})
+	})
+	r.Put("/enabled", func(w http.ResponseWriter, req *http.Request) {
+		var body struct {
+			Enabled bool `json:"enabled"`
+		}
+		decoder := json.NewDecoder(io.LimitReader(req.Body, 1025))
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&body); err != nil {
+			http.Error(w, "invalid request", http.StatusBadRequest)
+			return
+		}
+		if decoder.Decode(&struct{}{}) != io.EOF {
+			http.Error(w, "invalid request", http.StatusBadRequest)
+			return
+		}
+		c.enabled.Store(body.Enabled)
+		if !body.Enabled {
+			c.backend.Flush()
+		}
+		w.Header().Set("content-type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]bool{"enabled": body.Enabled})
 	})
 	r.Get("/dump", func(w http.ResponseWriter, req *http.Request) {
 		w.Header().Set("content-type", "application/octet-stream")
