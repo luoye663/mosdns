@@ -21,6 +21,7 @@ import (
 	"github.com/IrineSistiana/mosdns/v5/coremain"
 	"github.com/IrineSistiana/mosdns/v5/pkg/query_context"
 	"github.com/IrineSistiana/mosdns/v5/plugin/executable/dynamic_rule_engine"
+	fastforward "github.com/IrineSistiana/mosdns/v5/plugin/executable/forward"
 	"github.com/IrineSistiana/mosdns/v5/plugin/executable/sequence"
 	"github.com/miekg/dns"
 	"github.com/prometheus/client_golang/prometheus"
@@ -73,6 +74,7 @@ type QueryEvent struct {
 	Route                  string `json:"route"`
 	RouteSource            string `json:"route_source"`
 	UpstreamGroup          string `json:"upstream_group"`
+	UpstreamTag            string `json:"upstream_tag"`
 	CacheHit               bool   `json:"cache_hit"`
 	SnapshotVersion        uint64 `json:"snapshot_version"`
 	AccessRuleID           int64  `json:"access_rule_id"`
@@ -274,7 +276,7 @@ func (p *Plugin) buildEvent(qCtx *query_context.Context, started time.Time, exec
 	event := &QueryEvent{
 		SchemaVersion: eventSchemaVersion, EventID: p.newEventID(), TimestampUnixMS: time.Now().UnixMilli(), ProcessStartedAtUnixMS: p.processStarted.UnixMilli(),
 		ClientIP: qCtx.ServerMeta.ClientAddr.String(), Protocol: protocol(qCtx), QName: normalizeQName(question.Name), QType: question.Qtype, QClass: question.Qclass,
-		RCode: rcode, Route: route, RouteSource: routeSource, UpstreamGroup: upstream, CacheHit: qCtx.HasMark(p.marks.CacheHit),
+		RCode: rcode, Route: route, RouteSource: routeSource, UpstreamGroup: upstream, UpstreamTag: fastforward.SelectedUpstreamTag(qCtx), CacheHit: qCtx.HasMark(p.marks.CacheHit),
 		AnswerCount: answerCount, LatencyUS: time.Since(started).Microseconds(),
 	}
 	if decision, ok := dynamic_rule_engine.RuntimeDecisionFromContext(qCtx); ok {

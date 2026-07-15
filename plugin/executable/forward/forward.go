@@ -41,6 +41,10 @@ import (
 
 const PluginType = "forward"
 
+// selectedUpstreamKey 保存本次请求最终被 forward 采纳的上游 tag。
+// 值只在请求 goroutine 中写入，不能由并发的上游请求 goroutine 直接修改。
+var selectedUpstreamKey = query_context.RegKey()
+
 func init() {
 	coremain.RegNewPluginFunc(PluginType, Init, func() any { return new(Args) })
 	sequence.MustRegExecQuickSetup(PluginType, quickSetup)
@@ -254,8 +258,9 @@ func (f *Forward) exchange(ctx context.Context, qCtx *query_context.Context, us 
 	}
 
 	type res struct {
-		r   *dns.Msg
-		err error
+		r           *dns.Msg
+		err         error
+		upstreamTag string
 	}
 
 	resChan := make(chan res)
@@ -293,7 +298,7 @@ func (f *Forward) exchange(ctx context.Context, qCtx *query_context.Context, us 
 				}
 			}
 			select {
-			case resChan <- res{r: r, err: err}:
+			case resChan <- res{r: r, err: err, upstreamTag: u.cfg.Tag}:
 			case <-done:
 			}
 		}(qCtx.Id(), qCtx.QQuestion())
@@ -311,12 +316,28 @@ func (f *Forward) exchange(ctx context.Context, qCtx *query_context.Context, us 
 			if i < concurrent-1 && r.Rcode != dns.RcodeSuccess && r.Rcode != dns.RcodeNameError {
 				continue
 			}
+			// 只有此处的响应会成为客户端响应，因此记录的 tag 与实际选择一致。
+			// 未配置 tag 时保持为空，不能使用地址冒充精确上游标识。
+			if res.upstreamTag != "" {
+				qCtx.StoreValue(selectedUpstreamKey, res.upstreamTag)
+			}
 			return r, nil
 		case <-ctx.Done():
 			return nil, context.Cause(ctx)
 		}
 	}
 	return nil, errors.New("all upstream servers failed")
+}
+
+// SelectedUpstreamTag 返回本次 forward 实际采纳响应的配置 tag。
+// 没有转发、命中缓存、上游未配置 tag 或转发失败时返回空字符串。
+func SelectedUpstreamTag(qCtx *query_context.Context) string {
+	value, ok := qCtx.GetValue(selectedUpstreamKey)
+	tag, valid := value.(string)
+	if !ok || !valid {
+		return ""
+	}
+	return tag
 }
 
 func quickSetup(bq sequence.BQ, s string) (any, error) {

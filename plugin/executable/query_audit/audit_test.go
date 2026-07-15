@@ -3,6 +3,7 @@ package query_audit
 import (
 	"context"
 	"encoding/json"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
@@ -14,6 +15,7 @@ import (
 
 	"github.com/IrineSistiana/mosdns/v5/coremain"
 	"github.com/IrineSistiana/mosdns/v5/pkg/query_context"
+	fastforward "github.com/IrineSistiana/mosdns/v5/plugin/executable/forward"
 	"github.com/IrineSistiana/mosdns/v5/plugin/executable/sequence"
 	"github.com/miekg/dns"
 )
@@ -144,6 +146,37 @@ func TestNoLogSkipsEvent(t *testing.T) {
 	}
 	if len(p.queue) != 0 {
 		t.Fatal("no_log request was enqueued")
+	}
+}
+
+func TestBuildEventReportsSelectedUpstreamTag(t *testing.T) {
+	p := newTestAuditPlugin(t, "http://127.0.0.1:1", 1, 1)
+	defer p.Close()
+	qCtx := testContext("upstream.example")
+	conn, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := &dns.Server{PacketConn: conn, Handler: dns.HandlerFunc(func(w dns.ResponseWriter, request *dns.Msg) {
+		response := new(dns.Msg)
+		response.SetReply(request)
+		_ = w.WriteMsg(response)
+	})}
+	go func() { _ = server.ActivateAndServe() }()
+	t.Cleanup(func() { _ = server.Shutdown() })
+
+	// 通过真实 forward 执行写入 metadata，确保审计不依赖推测的路由上游组。
+	forward, err := fastforward.NewForward(&fastforward.Args{Upstreams: []fastforward.UpstreamConfig{{Tag: "audit-upstream", Addr: conn.LocalAddr().String()}}}, fastforward.Opts{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer forward.Close()
+	if err := forward.Exec(context.Background(), qCtx); err != nil {
+		t.Fatal(err)
+	}
+	event := p.buildEvent(qCtx, time.Now(), nil)
+	if event.UpstreamTag != "audit-upstream" {
+		t.Fatalf("upstream tag = %q, want audit-upstream", event.UpstreamTag)
 	}
 }
 
