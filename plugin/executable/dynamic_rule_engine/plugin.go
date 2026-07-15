@@ -12,7 +12,6 @@ import (
 	"github.com/IrineSistiana/mosdns/v5/coremain"
 	"github.com/IrineSistiana/mosdns/v5/pkg/query_context"
 	"github.com/IrineSistiana/mosdns/v5/plugin/executable/sequence"
-	"github.com/go-chi/chi/v5"
 	"github.com/prometheus/client_golang/prometheus"
 )
 
@@ -83,9 +82,7 @@ func Init(bp *coremain.BP, raw any) (any, error) {
 	if err := p.registerMetrics(bp); err != nil {
 		return nil, err
 	}
-	router := chi.NewRouter()
-	router.Mount("/", p.router())
-	bp.RegAPI(router)
+	bp.RegAPI(p.router())
 	return p, nil
 }
 
@@ -216,10 +213,11 @@ func (p *Plugin) registerMetrics(bp *coremain.BP) error {
 }
 
 func newPluginMetrics(labels prometheus.Labels) pluginMetrics {
+	const applyHelp = "Dynamic snapshot apply attempts."
 	return pluginMetrics{
-		applySuccess:  prometheus.NewCounter(prometheus.CounterOpts{Name: "apply_total", Help: "Applied dynamic snapshots.", ConstLabels: mergeLabels(labels, prometheus.Labels{"result": "success"})}),
-		applyFailure:  prometheus.NewCounter(prometheus.CounterOpts{Name: "apply_total", Help: "Failed dynamic snapshot applies.", ConstLabels: mergeLabels(labels, prometheus.Labels{"result": "failure"})}),
-		applyConflict: prometheus.NewCounter(prometheus.CounterOpts{Name: "apply_total", Help: "Conflicting dynamic snapshot applies.", ConstLabels: mergeLabels(labels, prometheus.Labels{"result": "conflict"})}),
+		applySuccess:  prometheus.NewCounter(prometheus.CounterOpts{Name: "apply_total", Help: applyHelp, ConstLabels: mergeLabels(labels, prometheus.Labels{"result": "success"})}),
+		applyFailure:  prometheus.NewCounter(prometheus.CounterOpts{Name: "apply_total", Help: applyHelp, ConstLabels: mergeLabels(labels, prometheus.Labels{"result": "failure"})}),
+		applyConflict: prometheus.NewCounter(prometheus.CounterOpts{Name: "apply_total", Help: applyHelp, ConstLabels: mergeLabels(labels, prometheus.Labels{"result": "conflict"})}),
 		match:         prometheus.NewCounterVec(prometheus.CounterOpts{Name: "match_total", Help: "Dynamic rule match decisions.", ConstLabels: labels}, []string{"access", "route"}),
 	}
 }

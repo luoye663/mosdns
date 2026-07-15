@@ -9,17 +9,20 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/go-chi/chi/v5"
 )
 
 const maxHardRequestBodyBytes int64 = 64 << 20
 
-func (p *Plugin) router() http.Handler {
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /status", p.handleStatus)
-	mux.HandleFunc("POST /validate", p.handleValidate)
-	mux.HandleFunc("PUT /snapshot", p.handleSnapshot)
-	mux.HandleFunc("POST /match", p.handleMatch)
-	return p.authorize(mux)
+func (p *Plugin) router() *chi.Mux {
+	router := chi.NewRouter()
+	router.Use(p.authorize)
+	router.Get("/status", p.handleStatus)
+	router.Post("/validate", p.handleValidate)
+	router.Put("/snapshot", p.handleSnapshot)
+	router.Post("/match", p.handleMatch)
+	return router
 }
 
 // authorize 统一保护插件全部控制面端点；token 比较使用恒定时间函数。

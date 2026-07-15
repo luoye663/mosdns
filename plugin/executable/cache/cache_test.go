@@ -22,6 +22,8 @@ package cache
 import (
 	"bytes"
 	"github.com/miekg/dns"
+	"net/http"
+	"net/http/httptest"
 	"strconv"
 	"testing"
 	"time"
@@ -58,5 +60,32 @@ func Test_cachePlugin_Dump(t *testing.T) {
 
 	if enw != enr {
 		t.Fatalf("read err, wrote %d entries, read %d", enw, enr)
+	}
+}
+
+func TestCacheAPIRequiresControlToken(t *testing.T) {
+	c := NewCache(&Args{Size: 16}, Opts{})
+	c.controlToken = []byte("cache-test-token")
+
+	for _, testCase := range []struct {
+		name  string
+		token string
+		want  int
+	}{
+		{name: "missing", want: http.StatusUnauthorized},
+		{name: "wrong", token: "wrong", want: http.StatusUnauthorized},
+		{name: "valid", token: "cache-test-token", want: http.StatusOK},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, "/flush", nil)
+			if testCase.token != "" {
+				req.Header.Set("Authorization", "Bearer "+testCase.token)
+			}
+			response := httptest.NewRecorder()
+			c.Api().ServeHTTP(response, req)
+			if response.Code != testCase.want {
+				t.Fatalf("status = %d, want %d", response.Code, testCase.want)
+			}
+		})
 	}
 }

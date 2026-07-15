@@ -21,6 +21,7 @@ package cache
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -28,6 +29,7 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -73,6 +75,8 @@ type Args struct {
 	LazyCacheTTL int    `yaml:"lazy_cache_ttl"`
 	DumpFile     string `yaml:"dump_file"`
 	DumpInterval int    `yaml:"dump_interval"`
+	// AuthTokenFile 仅保护通过 mosdns HTTP API 暴露的缓存操作，不参与 DNS 查询路径。
+	AuthTokenFile string `yaml:"auth_token_file"`
 }
 
 func (a *Args) init() {
@@ -89,6 +93,7 @@ type Cache struct {
 	closeOnce    sync.Once
 	closeNotify  chan struct{}
 	updatedKey   atomic.Uint64
+	controlToken []byte
 
 	queryTotal   prometheus.Counter
 	hitTotal     prometheus.Counter
@@ -97,10 +102,23 @@ type Cache struct {
 }
 
 func Init(bp *coremain.BP, args any) (any, error) {
-	c := NewCache(args.(*Args), Opts{
+	cacheArgs := args.(*Args)
+	if len(cacheArgs.AuthTokenFile) == 0 {
+		return nil, errors.New("auth_token_file is required for cache plugin API")
+	}
+	token, err := os.ReadFile(cacheArgs.AuthTokenFile)
+	if err != nil {
+		return nil, fmt.Errorf("read auth_token_file: %w", err)
+	}
+	token = []byte(strings.TrimSpace(string(token)))
+	if len(token) == 0 {
+		return nil, errors.New("auth_token_file is empty")
+	}
+	c := NewCache(cacheArgs, Opts{
 		Logger:     bp.L(),
 		MetricsTag: bp.Tag(),
 	})
+	c.controlToken = token
 
 	if err := c.RegMetricsTo(prometheus.WrapRegistererWithPrefix(PluginType+"_", bp.M().GetMetricsReg())); err != nil {
 		return nil, fmt.Errorf("failed to register metrics, %w", err)
@@ -319,6 +337,7 @@ func (c *Cache) dumpCache() error {
 
 func (c *Cache) Api() *chi.Mux {
 	r := chi.NewRouter()
+	r.Use(c.requireControlToken)
 	r.Get("/flush", func(w http.ResponseWriter, req *http.Request) {
 		c.backend.Flush()
 	})
@@ -338,6 +357,20 @@ func (c *Cache) Api() *chi.Mux {
 		w.WriteHeader(http.StatusOK)
 	})
 	return r
+}
+
+// requireControlToken 保护 flush、dump 和 load_dump，避免内部 API 被未认证调用。
+func (c *Cache) requireControlToken(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		const bearerPrefix = "Bearer "
+		authorization := req.Header.Get("Authorization")
+		provided := strings.TrimPrefix(authorization, bearerPrefix)
+		if len(c.controlToken) == 0 || !strings.HasPrefix(authorization, bearerPrefix) || subtle.ConstantTimeCompare([]byte(provided), c.controlToken) != 1 {
+			http.Error(w, "authorization required", http.StatusUnauthorized)
+			return
+		}
+		next.ServeHTTP(w, req)
+	})
 }
 
 func (c *Cache) writeDump(w io.Writer) (int, error) {
