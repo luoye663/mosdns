@@ -23,6 +23,7 @@ package plugin
 import (
 	// data provider
 	_ "github.com/IrineSistiana/mosdns/v5/plugin/data_provider/domain_set"
+	_ "github.com/IrineSistiana/mosdns/v5/plugin/data_provider/dynamic_domain_set"
 	_ "github.com/IrineSistiana/mosdns/v5/plugin/data_provider/ip_set"
 
 	// matcher
@@ -47,8 +48,8 @@ import (
 	_ "github.com/IrineSistiana/mosdns/v5/plugin/executable/debug_print"
 	_ "github.com/IrineSistiana/mosdns/v5/plugin/executable/drop_resp"
 	_ "github.com/IrineSistiana/mosdns/v5/plugin/executable/dual_selector"
-	_ "github.com/IrineSistiana/mosdns/v5/plugin/executable/dynamic_rule_engine"
 	_ "github.com/IrineSistiana/mosdns/v5/plugin/executable/dynamic_forward"
+	_ "github.com/IrineSistiana/mosdns/v5/plugin/executable/dynamic_rule_engine"
 	_ "github.com/IrineSistiana/mosdns/v5/plugin/executable/ecs_handler"
 	_ "github.com/IrineSistiana/mosdns/v5/plugin/executable/forward"
 	_ "github.com/IrineSistiana/mosdns/v5/plugin/executable/forward_edns0opt"
