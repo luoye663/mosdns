@@ -1,5 +1,7 @@
 FROM --platform=$BUILDPLATFORM golang:1.26-alpine AS builder
 WORKDIR /src
+ARG GOPROXY=https://proxy.golang.org,direct
+ENV GOPROXY=${GOPROXY}
 COPY . .
 ARG PROJECT_VERSION=dev
 ARG GIT_COMMIT=unknown
