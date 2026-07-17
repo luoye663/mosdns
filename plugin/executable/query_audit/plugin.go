@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -23,6 +24,7 @@ import (
 	"github.com/IrineSistiana/mosdns/v5/plugin/executable/dynamic_rule_engine"
 	fastforward "github.com/IrineSistiana/mosdns/v5/plugin/executable/forward"
 	"github.com/IrineSistiana/mosdns/v5/plugin/executable/sequence"
+	"github.com/go-chi/chi/v5"
 	"github.com/miekg/dns"
 	"github.com/prometheus/client_golang/prometheus"
 )
@@ -126,6 +128,7 @@ type Plugin struct {
 	cancel  context.CancelFunc
 	wg      sync.WaitGroup
 	metrics auditMetrics
+	dropped atomic.Uint64
 }
 
 var (
@@ -150,6 +153,7 @@ func Init(bp *coremain.BP, raw any) (any, error) {
 		_ = p.Close()
 		return nil, err
 	}
+	bp.RegAPI(p.Api())
 	p.startWorker()
 	return p, nil
 }
@@ -317,7 +321,32 @@ func (p *Plugin) enqueueNonBlocking(event *QueryEvent) {
 		p.metrics.queueSize.Inc()
 	default:
 		p.metrics.dropped.WithLabelValues("queue_full").Inc()
+		p.dropped.Add(1)
 	}
+}
+
+// Api exposes only non-sensitive runtime health values to the authenticated controller.
+func (p *Plugin) Api() *chi.Mux {
+	router := chi.NewRouter()
+	router.Use(p.authorize)
+	router.Get("/status", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"queue_depth": len(p.queue), "queue_capacity": cap(p.queue), "dropped_events": p.dropped.Load()})
+	})
+	return router
+}
+
+func (p *Plugin) authorize(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		const prefix = "Bearer "
+		value := r.Header.Get("Authorization")
+		provided := []byte(strings.TrimPrefix(value, prefix))
+		if !strings.HasPrefix(value, prefix) || len(provided) != len(p.token) || subtle.ConstantTimeCompare(provided, p.token) != 1 {
+			http.Error(w, "authorization required", http.StatusUnauthorized)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 func (p *Plugin) runWorker() {
@@ -379,6 +408,7 @@ func (p *Plugin) send(events []QueryEvent, parent context.Context) {
 		}
 	}
 	p.metrics.batches.WithLabelValues("failure").Inc()
+	p.dropped.Add(uint64(len(events)))
 }
 
 func (p *Plugin) sendOnce(events []QueryEvent, parent context.Context) error {
