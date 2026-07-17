@@ -168,6 +168,7 @@ func TestRouteMarksFromFinalSequenceUseDefaultSource(t *testing.T) {
 	}{
 		{name: "remote", mark: p.marks.RouteRemote, wantRoute: "remote", wantSource: "default", wantGroup: "remote_dns"},
 		{name: "local", mark: p.marks.RouteLocal, wantRoute: "local", wantSource: "default", wantGroup: "local_dns"},
+		{name: "geosite", mark: p.marks.GeoSiteLocal, wantRoute: "local", wantSource: "geosite", wantGroup: "local_dns"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			qCtx := testContext(test.name + ".example")
