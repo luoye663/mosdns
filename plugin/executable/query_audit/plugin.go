@@ -63,28 +63,29 @@ type Args struct {
 
 // QueryEvent 是 controller ingest 接口使用的最小隐私审计记录。
 type QueryEvent struct {
-	SchemaVersion          int    `json:"schema_version"`
-	EventID                string `json:"event_id"`
-	TimestampUnixMS        int64  `json:"timestamp_unix_ms"`
-	ProcessStartedAtUnixMS int64  `json:"process_started_at_unix_ms"`
-	ClientIP               string `json:"client_ip"`
-	Protocol               string `json:"protocol"`
-	QName                  string `json:"qname"`
-	QType                  uint16 `json:"qtype"`
-	QClass                 uint16 `json:"qclass"`
-	RCode                  int    `json:"rcode"`
-	Route                  string `json:"route"`
-	RouteSource            string `json:"route_source"`
-	UpstreamGroup          string `json:"upstream_group"`
-	UpstreamTag            string `json:"upstream_tag"`
-	CacheHit               bool   `json:"cache_hit"`
-	SnapshotVersion        uint64 `json:"snapshot_version"`
-	AccessRuleID           int64  `json:"access_rule_id"`
-	RouteRuleID            int64  `json:"route_rule_id"`
-	AnswerCount            int    `json:"answer_count"`
-	LatencyUS              int64  `json:"latency_us"`
-	ErrorCode              string `json:"error_code"`
-	ErrorText              string `json:"error_text"`
+	SchemaVersion          int      `json:"schema_version"`
+	EventID                string   `json:"event_id"`
+	TimestampUnixMS        int64    `json:"timestamp_unix_ms"`
+	ProcessStartedAtUnixMS int64    `json:"process_started_at_unix_ms"`
+	ClientIP               string   `json:"client_ip"`
+	Protocol               string   `json:"protocol"`
+	QName                  string   `json:"qname"`
+	QType                  uint16   `json:"qtype"`
+	QClass                 uint16   `json:"qclass"`
+	RCode                  int      `json:"rcode"`
+	Route                  string   `json:"route"`
+	RouteSource            string   `json:"route_source"`
+	UpstreamGroup          string   `json:"upstream_group"`
+	UpstreamTag            string   `json:"upstream_tag"`
+	CacheHit               bool     `json:"cache_hit"`
+	SnapshotVersion        uint64   `json:"snapshot_version"`
+	AccessRuleID           int64    `json:"access_rule_id"`
+	RouteRuleID            int64    `json:"route_rule_id"`
+	AnswerCount            int      `json:"answer_count"`
+	AnswerIPs              []string `json:"answer_ips,omitempty"`
+	LatencyUS              int64    `json:"latency_us"`
+	ErrorCode              string   `json:"error_code"`
+	ErrorText              string   `json:"error_text"`
 }
 
 type eventBatch struct {
@@ -117,6 +118,7 @@ type Plugin struct {
 	flushInterval  time.Duration
 	requestTimeout time.Duration
 	maxRetries     int
+	includeAnswers bool
 	includeErrors  bool
 	maxErrorBytes  int
 	marks          Marks
@@ -181,7 +183,7 @@ func newPlugin(args Args) (*Plugin, error) {
 	p := &Plugin{
 		queue: make(chan QueryEvent, args.QueueSize), endpoint: args.Endpoint, token: token,
 		batchSize: args.BatchSize, flushInterval: flushInterval, requestTimeout: requestTimeout,
-		maxRetries: args.MaxRetries, includeErrors: args.IncludeErrorText, maxErrorBytes: args.MaxErrorTextBytes,
+		maxRetries: args.MaxRetries, includeAnswers: args.IncludeAnswers, includeErrors: args.IncludeErrorText, maxErrorBytes: args.MaxErrorTextBytes,
 		marks: args.Marks, client: &http.Client{}, processStarted: time.Now().UTC(), eventPrefix: prefix, ctx: ctx, cancel: cancel,
 	}
 	p.metrics = newAuditMetrics(nil)
@@ -225,9 +227,6 @@ func validateArgs(args *Args) error {
 	}
 	if args.MaxRetries < 0 || args.MaxRetries > 1 {
 		return fmt.Errorf("max_retries must be within 0..1")
-	}
-	if args.IncludeAnswers {
-		return fmt.Errorf("include_answers is unsupported in MVP and must be false")
 	}
 	if args.MaxErrorTextBytes < 0 || args.MaxErrorTextBytes > 4096 {
 		return fmt.Errorf("max_error_text_bytes must be within 0..4096")
@@ -295,7 +294,37 @@ func (p *Plugin) buildEvent(qCtx *query_context.Context, started time.Time, exec
 			event.ErrorText = truncate(execErr.Error(), p.maxErrorBytes)
 		}
 	}
+	if p.includeAnswers && response != nil {
+		event.AnswerIPs = answerIPs(response)
+	}
 	return event
+}
+
+// answerIPs retains only A and AAAA data for the controller's bounded memory cache.
+func answerIPs(response *dns.Msg) []string {
+	const maxAnswerIPs = 16
+	ips := make([]string, 0, maxAnswerIPs)
+	seen := make(map[string]struct{}, maxAnswerIPs)
+	for _, record := range response.Answer {
+		var ip string
+		switch value := record.(type) {
+		case *dns.A:
+			ip = value.A.String()
+		case *dns.AAAA:
+			ip = value.AAAA.String()
+		default:
+			continue
+		}
+		if _, ok := seen[ip]; ok {
+			continue
+		}
+		seen[ip] = struct{}{}
+		ips = append(ips, ip)
+		if len(ips) == maxAnswerIPs {
+			break
+		}
+	}
+	return ips
 }
 
 func (p *Plugin) route(qCtx *query_context.Context) (route, source, upstream string) {
