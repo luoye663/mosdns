@@ -135,6 +135,31 @@ func TestExecObservesGotoAndAccept(t *testing.T) {
 	}
 }
 
+func TestRouteMarksFromFinalSequenceUseDefaultSource(t *testing.T) {
+	p := newTestAuditPlugin(t, "http://127.0.0.1:1", 1, 1)
+	defer p.Close()
+
+	for _, test := range []struct {
+		name       string
+		mark       uint32
+		wantRoute  string
+		wantSource string
+		wantGroup  string
+	}{
+		{name: "remote", mark: p.marks.RouteRemote, wantRoute: "remote", wantSource: "default", wantGroup: "remote_dns"},
+		{name: "local", mark: p.marks.RouteLocal, wantRoute: "local", wantSource: "default", wantGroup: "local_dns"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			qCtx := testContext(test.name + ".example")
+			qCtx.SetMark(test.mark)
+			route, source, group := p.route(qCtx)
+			if route != test.wantRoute || source != test.wantSource || group != test.wantGroup {
+				t.Fatalf("route() = (%q, %q, %q), want (%q, %q, %q)", route, source, group, test.wantRoute, test.wantSource, test.wantGroup)
+			}
+		})
+	}
+}
+
 func TestNoLogSkipsEvent(t *testing.T) {
 	p := newTestAuditPlugin(t, "http://127.0.0.1:1", 1, 1)
 	defer p.Close()

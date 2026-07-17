@@ -302,11 +302,21 @@ func (p *Plugin) route(qCtx *query_context.Context) (route, source, upstream str
 	if qCtx.HasMark(p.marks.AccessBlock) {
 		return "block", "dynamic_rule", ""
 	}
+	dynamicSource := false
+	if decision, ok := dynamic_rule_engine.RuntimeDecisionFromContext(qCtx); ok {
+		dynamicSource = decision.RouteSource == "dynamic_rule"
+	}
 	if qCtx.HasMark(p.marks.RouteLocal) {
-		return "local", "dynamic_rule", "local_dns"
+		if dynamicSource {
+			return "local", "dynamic_rule", "local_dns"
+		}
+		return "local", "default", "local_dns"
 	}
 	if qCtx.HasMark(p.marks.RouteRemote) {
-		return "remote", "dynamic_rule", "remote_dns"
+		if dynamicSource {
+			return "remote", "dynamic_rule", "remote_dns"
+		}
+		return "remote", "default", "remote_dns"
 	}
 	return "remote", "default", "remote_dns"
 }
