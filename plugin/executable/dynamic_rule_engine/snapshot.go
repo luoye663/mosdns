@@ -3,7 +3,7 @@ package dynamic_rule_engine
 import "time"
 
 const (
-	SchemaVersion = 1
+	SchemaVersion = 2
 
 	CategoryAccess  = "access"
 	CategoryRoute   = "route"
@@ -41,13 +41,26 @@ func DefaultLimits() Limits {
 
 // Snapshot 是 controller 与运行时共享的完整规则版本，不支持运行时增量修改。
 type Snapshot struct {
-	SchemaVersion          uint32    `json:"schema_version"`
-	Version                uint64    `json:"version"`
-	ExpectedCurrentVersion uint64    `json:"expected_current_version"`
-	GeneratedAt            time.Time `json:"generated_at"`
-	Checksum               string    `json:"checksum,omitempty"`
-	BlockRCode             int       `json:"block_rcode"`
-	Rules                  []Rule    `json:"rules"`
+	SchemaVersion          uint32            `json:"schema_version"`
+	Version                uint64            `json:"version"`
+	ExpectedCurrentVersion uint64            `json:"expected_current_version"`
+	GeneratedAt            time.Time         `json:"generated_at"`
+	Checksum               string            `json:"checksum,omitempty"`
+	BlockRCode             int               `json:"block_rcode"`
+	Rules                  []Rule            `json:"rules"`
+	SubscriptionSets       []SubscriptionSet `json:"subscription_sets,omitempty"`
+}
+
+// SubscriptionSet is one source-managed, immutable domain collection. It is
+// intentionally separate from Rule so large source files do not become a
+// database row and runtime object per domain.
+type SubscriptionSet struct {
+	SourceID   int64    `json:"source_id"`
+	SourceName string   `json:"source_name"`
+	Category   string   `json:"category"`
+	Action     string   `json:"action"`
+	Priority   int      `json:"priority"`
+	Domains    []string `json:"domains"`
 }
 
 // Rule 保留发布快照中需要审计和确定性排序的全部字段。
@@ -64,11 +77,13 @@ type Rule struct {
 
 // MatchedRule 是请求匹配结果中可安全传递到后续审计阶段的不可变值。
 type MatchedRule struct {
-	RuleID    int64
-	Action    string
-	MatchType string
-	Pattern   string
-	Priority  int
+	RuleID     int64
+	Action     string
+	MatchType  string
+	Pattern    string
+	Priority   int
+	SourceID   int64
+	SourceName string
 }
 
 func (m MatchedRule) Matched() bool {
@@ -87,11 +102,13 @@ type MatchResult struct {
 // RuntimeDecision 是绑定到单个 DNS 请求生命周期的只读决策信息。
 // query_audit 在后置阶段读取它，不能在写入后修改。
 type RuntimeDecision struct {
-	SnapshotVersion uint64
-	AccessRuleID    int64
-	RouteRuleID     int64
-	LoggingRuleID   int64
-	AccessAction    string
-	RouteAction     string
-	RouteSource     string
+	SnapshotVersion        uint64
+	AccessRuleID           int64
+	RouteRuleID            int64
+	LoggingRuleID          int64
+	AccessAction           string
+	RouteAction            string
+	RouteSource            string
+	SubscriptionSourceID   int64
+	SubscriptionSourceName string
 }

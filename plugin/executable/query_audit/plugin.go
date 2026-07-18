@@ -39,11 +39,11 @@ var Version = "dev"
 
 // Marks 统一定义审计读取的 marks，启动时会检查彼此不冲突。
 type Marks struct {
-	AccessBlock  uint32 `yaml:"access_block"`
-	RouteLocal   uint32 `yaml:"route_local"`
-	RouteRemote  uint32 `yaml:"route_remote"`
-	NoLog        uint32 `yaml:"no_log"`
-	CacheHit     uint32 `yaml:"cache_hit"`
+	AccessBlock uint32 `yaml:"access_block"`
+	RouteLocal  uint32 `yaml:"route_local"`
+	RouteRemote uint32 `yaml:"route_remote"`
+	NoLog       uint32 `yaml:"no_log"`
+	CacheHit    uint32 `yaml:"cache_hit"`
 }
 
 // Args 是 query_audit 的 YAML 配置；启用 include_answers 时仅携带 A/AAAA 地址。
@@ -81,6 +81,8 @@ type QueryEvent struct {
 	SnapshotVersion        uint64   `json:"snapshot_version"`
 	AccessRuleID           int64    `json:"access_rule_id"`
 	RouteRuleID            int64    `json:"route_rule_id"`
+	SubscriptionSourceID   int64    `json:"subscription_source_id"`
+	SubscriptionSourceName string   `json:"subscription_source_name"`
 	AnswerCount            int      `json:"answer_count"`
 	AnswerMinTTLSeconds    *uint32  `json:"answer_min_ttl_seconds"`
 	AnswerIPs              []string `json:"answer_ips,omitempty"`
@@ -285,6 +287,7 @@ func (p *Plugin) buildEvent(qCtx *query_context.Context, started time.Time, exec
 	}
 	if decision, ok := dynamic_rule_engine.RuntimeDecisionFromContext(qCtx); ok {
 		event.SnapshotVersion, event.AccessRuleID, event.RouteRuleID = decision.SnapshotVersion, decision.AccessRuleID, decision.RouteRuleID
+		event.SubscriptionSourceID, event.SubscriptionSourceName = decision.SubscriptionSourceID, decision.SubscriptionSourceName
 		if event.RouteSource == "" {
 			event.RouteSource = decision.RouteSource
 		}

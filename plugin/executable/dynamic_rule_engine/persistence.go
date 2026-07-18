@@ -23,12 +23,17 @@ func canonicalSnapshot(snapshot Snapshot, limits Limits) (Snapshot, *CompiledSna
 		}
 		rules = append(rules, normalized)
 	}
-	checksum, rules, err := checksumSnapshot(snapshot, rules)
+	sets, err := normalizeSubscriptionSets(snapshot.SubscriptionSets, normalizeLimits(limits))
+	if err != nil {
+		return Snapshot{}, nil, err
+	}
+	checksum, rules, err := checksumSnapshot(snapshot, rules, sets)
 	if err != nil {
 		return Snapshot{}, nil, err
 	}
 	snapshot.GeneratedAt = snapshot.GeneratedAt.UTC()
 	snapshot.Rules = rules
+	snapshot.SubscriptionSets = sets
 	snapshot.Checksum = checksum
 	return snapshot, compiled, nil
 }

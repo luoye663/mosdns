@@ -244,7 +244,7 @@ func (p *Plugin) Exec(_ context.Context, qCtx *query_context.Context) error {
 		return nil
 	} // 非法 QNAME 不影响 DNS 主链路。
 	p.recordMatch(result)
-	decision := RuntimeDecision{SnapshotVersion: result.SnapshotVersion, AccessRuleID: result.Access.RuleID, RouteRuleID: result.Route.RuleID, LoggingRuleID: result.Logging.RuleID, AccessAction: result.Access.Action, RouteAction: result.Route.Action}
+	decision := RuntimeDecision{SnapshotVersion: result.SnapshotVersion, AccessRuleID: result.Access.RuleID, RouteRuleID: result.Route.RuleID, LoggingRuleID: result.Logging.RuleID, AccessAction: result.Access.Action, RouteAction: result.Route.Action, SubscriptionSourceID: result.Route.SourceID, SubscriptionSourceName: result.Route.SourceName}
 	if result.Access.Action == ActionBlock {
 		qCtx.SetMark(p.marks.AccessBlock)
 	}

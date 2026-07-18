@@ -75,6 +75,19 @@ func TestAccessAllowWinsExactTie(t *testing.T) {
 	}
 }
 
+func TestSubscriptionSetMatchesSuffixAndReportsSource(t *testing.T) {
+	snapshot := testSnapshot()
+	snapshot.SubscriptionSets = []SubscriptionSet{{SourceID: 42, SourceName: "domestic-list", Category: CategoryRoute, Action: ActionLocal, Priority: 100, Domains: []string{"example.cn", "api.example.cn"}}}
+	compiled, err := Compile(snapshot, DefaultLimits())
+	if err != nil {
+		t.Fatal(err)
+	}
+	matched, err := compiled.Match("www.api.example.cn")
+	if err != nil || matched.Route.SourceID != 42 || matched.Route.SourceName != "domestic-list" || matched.Route.Action != ActionLocal {
+		t.Fatalf("match=%+v err=%v", matched, err)
+	}
+}
+
 func TestCompileRejectsRouteConflict(t *testing.T) {
 	_, err := Compile(testSnapshot(
 		Rule{ID: 1, Category: CategoryRoute, Action: ActionLocal, MatchType: MatchTypeDomain, Pattern: "example.com", Priority: 100},

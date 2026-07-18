@@ -12,8 +12,6 @@ import (
 	"strings"
 	"time"
 	"unicode/utf8"
-
-	"github.com/IrineSistiana/mosdns/v5/pkg/matcher/domain"
 )
 
 const categoryCount = 3
@@ -22,6 +20,10 @@ type compiledRegex struct {
 	re       *regexp.Regexp
 	match    MatchedRule
 	category int
+}
+type compiledSubscriptionSet struct {
+	match   MatchedRule
+	domains []string
 }
 
 // CompiledSnapshot 的索引仅在 Compile 完成前写入；发布后只读。
@@ -34,9 +36,10 @@ type CompiledSnapshot struct {
 	regexpCount   int
 	loadedAt      time.Time
 
-	full   [categoryCount]map[string]MatchedRule
-	domain [categoryCount]*domain.SubDomainMatcher[MatchedRule]
-	regex  []compiledRegex
+	full          [categoryCount]map[string]MatchedRule
+	domain        [categoryCount]map[string]MatchedRule
+	regex         []compiledRegex
+	subscriptions [categoryCount][]compiledSubscriptionSet
 }
 
 func (s *CompiledSnapshot) SchemaVersion() uint32 { return s.schemaVersion }
@@ -50,7 +53,7 @@ func (s *CompiledSnapshot) LoadedAt() time.Time   { return s.loadedAt }
 // Compile 在 DNS 请求路径外执行全部校验和索引构建。
 func Compile(snapshot Snapshot, limits Limits) (*CompiledSnapshot, error) {
 	limits = normalizeLimits(limits)
-	if snapshot.SchemaVersion != SchemaVersion {
+	if snapshot.SchemaVersion != 1 && snapshot.SchemaVersion != SchemaVersion {
 		return nil, fmt.Errorf("schema_version %d is unsupported", snapshot.SchemaVersion)
 	}
 	if snapshot.Version == 0 {
@@ -59,8 +62,8 @@ func Compile(snapshot Snapshot, limits Limits) (*CompiledSnapshot, error) {
 	if snapshot.BlockRCode < 0 || snapshot.BlockRCode > 0xFFF {
 		return nil, fmt.Errorf("block_rcode %d is invalid", snapshot.BlockRCode)
 	}
-	if len(snapshot.Rules) > limits.MaxRules {
-		return nil, fmt.Errorf("rule count %d exceeds %d", len(snapshot.Rules), limits.MaxRules)
+	if len(snapshot.Rules)+subscriptionDomainCount(snapshot.SubscriptionSets) > limits.MaxRules {
+		return nil, fmt.Errorf("rule count exceeds %d", limits.MaxRules)
 	}
 
 	normalizedRules := make([]Rule, 0, len(snapshot.Rules))
@@ -86,8 +89,15 @@ func Compile(snapshot Snapshot, limits Limits) (*CompiledSnapshot, error) {
 	if err := validateRouteConflicts(normalizedRules); err != nil {
 		return nil, err
 	}
+	normalizedSets, err := normalizeSubscriptionSets(snapshot.SubscriptionSets, limits)
+	if err != nil {
+		return nil, err
+	}
+	if err := validateSubscriptionRouteConflicts(normalizedRules, normalizedSets); err != nil {
+		return nil, err
+	}
 
-	checksum, canonicalRules, err := checksumSnapshot(snapshot, normalizedRules)
+	checksum, canonicalRules, err := checksumSnapshot(snapshot, normalizedRules, normalizedSets)
 	if err != nil {
 		return nil, err
 	}
@@ -106,14 +116,88 @@ func Compile(snapshot Snapshot, limits Limits) (*CompiledSnapshot, error) {
 	}
 	for i := range compiled.full {
 		compiled.full[i] = make(map[string]MatchedRule)
-		compiled.domain[i] = domain.NewSubDomainMatcher[MatchedRule]()
+		compiled.domain[i] = make(map[string]MatchedRule)
 	}
 	for _, rule := range canonicalRules {
 		if err := compiled.addRule(rule); err != nil {
 			return nil, err
 		}
 	}
+	if err := compiled.addSubscriptionSets(normalizedSets, limits); err != nil {
+		return nil, err
+	}
+	compiled.ruleCount += subscriptionDomainCount(snapshot.SubscriptionSets)
 	return compiled, nil
+}
+
+func normalizeSubscriptionSets(sets []SubscriptionSet, limits Limits) ([]SubscriptionSet, error) {
+	result := make([]SubscriptionSet, len(sets))
+	seen := make(map[int64]struct{}, len(sets))
+	for i, set := range sets {
+		if _, exists := seen[set.SourceID]; exists {
+			return nil, fmt.Errorf("duplicate subscription set %d", set.SourceID)
+		}
+		seen[set.SourceID] = struct{}{}
+		category, ok := categoryIndex(set.Category)
+		if !ok || category < 0 || !validAction(set.Category, set.Action) || set.SourceID <= 0 || set.SourceName == "" || set.Priority < 0 || set.Priority > 1000 || len(set.Domains) == 0 {
+			return nil, fmt.Errorf("invalid subscription set %d", set.SourceID)
+		}
+		domains := make([]string, len(set.Domains))
+		for j, value := range set.Domains {
+			normalized, err := NormalizeDomain(value)
+			if err != nil || len(normalized) > limits.MaxDomainChars {
+				return nil, fmt.Errorf("subscription set %d domain %d is invalid", set.SourceID, j)
+			}
+			domains[j] = normalized
+		}
+		sort.Strings(domains)
+		for j := 1; j < len(domains); j++ {
+			if domains[j] == domains[j-1] {
+				return nil, fmt.Errorf("subscription set %d contains duplicate domains", set.SourceID)
+			}
+		}
+		set.Domains = domains
+		result[i] = set
+	}
+	sort.Slice(result, func(i, j int) bool { return result[i].SourceID < result[j].SourceID })
+	return result, nil
+}
+
+func (s *CompiledSnapshot) addSubscriptionSets(sets []SubscriptionSet, limits Limits) error {
+	for _, set := range sets {
+		category, _ := categoryIndex(set.Category)
+		s.subscriptions[category] = append(s.subscriptions[category], compiledSubscriptionSet{match: MatchedRule{RuleID: set.SourceID, Action: set.Action, MatchType: MatchTypeDomain, Priority: set.Priority, SourceID: set.SourceID, SourceName: set.SourceName}, domains: set.Domains})
+	}
+	return nil
+}
+func subscriptionDomainCount(sets []SubscriptionSet) int {
+	total := 0
+	for _, set := range sets {
+		total += len(set.Domains)
+	}
+	return total
+}
+
+func validateSubscriptionRouteConflicts(rules []Rule, sets []SubscriptionSet) error {
+	seen := map[string]string{}
+	for _, rule := range rules {
+		if rule.Category == CategoryRoute && rule.MatchType == MatchTypeDomain {
+			seen[rule.Pattern+"\x00"+fmt.Sprint(rule.Priority)] = rule.Action
+		}
+	}
+	for _, set := range sets {
+		if set.Category != CategoryRoute {
+			continue
+		}
+		for _, domain := range set.Domains {
+			key := domain + "\x00" + fmt.Sprint(set.Priority)
+			if action, exists := seen[key]; exists && action != set.Action {
+				return fmt.Errorf("route conflict for subscription domain %q", domain)
+			}
+			seen[key] = set.Action
+		}
+	}
+	return nil
 }
 
 func (s *CompiledSnapshot) addRule(rule Rule) error {
@@ -126,11 +210,7 @@ func (s *CompiledSnapshot) addRule(rule Rule) error {
 	case MatchTypeFull:
 		s.full[category][rule.Pattern] = preferred(match, s.full[category][rule.Pattern], category)
 	case MatchTypeDomain:
-		current, ok := s.domain[category].Match(rule.Pattern)
-		if !ok || current.Pattern != rule.Pattern {
-			return s.domain[category].Add(rule.Pattern, match)
-		}
-		return s.domain[category].Add(rule.Pattern, preferred(match, current, category))
+		s.domain[category][rule.Pattern] = preferred(match, s.domain[category][rule.Pattern], category)
 	case MatchTypeRegexp:
 		re, err := regexp.Compile(rule.Pattern)
 		if err != nil {
@@ -157,16 +237,49 @@ func (s *CompiledSnapshot) matchCategory(qname string, category int) MatchedRule
 	if match, ok := s.full[category][qname]; ok {
 		return match
 	}
-	if match, ok := s.domain[category].Match(qname); ok {
-		return match
-	}
 	var best MatchedRule
+	// A flat suffix table avoids one map allocation per domain label while
+	// retaining the deepest-domain-first matching semantics of the old trie.
+	for suffix := qname; suffix != ""; {
+		if match, ok := s.domain[category][suffix]; ok {
+			best = match
+			break
+		}
+		separator := strings.IndexByte(suffix, '.')
+		if separator < 0 {
+			break
+		}
+		suffix = suffix[separator+1:]
+	}
+	for _, set := range s.subscriptions[category] {
+		if subscriptionMatches(set.domains, qname) {
+			best = preferred(set.match, best, category)
+		}
+	}
+	if best.Matched() {
+		return best
+	}
 	for _, rule := range s.regex {
 		if rule.category == category && rule.re.MatchString(qname) {
 			best = preferred(rule.match, best, category)
 		}
 	}
 	return best
+}
+
+func subscriptionMatches(domains []string, qname string) bool {
+	for suffix := qname; suffix != ""; {
+		i := sort.SearchStrings(domains, suffix)
+		if i < len(domains) && domains[i] == suffix {
+			return true
+		}
+		separator := strings.IndexByte(suffix, '.')
+		if separator < 0 {
+			return false
+		}
+		suffix = suffix[separator+1:]
+	}
+	return false
 }
 
 func normalizeLimits(l Limits) Limits {
@@ -298,12 +411,11 @@ func validateRouteConflicts(rules []Rule) error {
 	return nil
 }
 
-func checksumSnapshot(snapshot Snapshot, rules []Rule) (string, []Rule, error) {
-	// Preserve an explicit empty array so its checksum matches controller snapshots.
-	canonicalRules := make([]Rule, len(rules))
-	copy(canonicalRules, rules)
-	sort.Slice(canonicalRules, func(i, j int) bool {
-		a, b := canonicalRules[i], canonicalRules[j]
+func checksumSnapshot(snapshot Snapshot, rules []Rule, sets []SubscriptionSet) (string, []Rule, error) {
+	// rules is already a private normalized slice. Sort it in place to avoid a
+	// second full rule slice while compiling large subscription snapshots.
+	sort.Slice(rules, func(i, j int) bool {
+		a, b := rules[i], rules[j]
 		if a.Category != b.Category {
 			return a.Category < b.Category
 		}
@@ -318,13 +430,13 @@ func checksumSnapshot(snapshot Snapshot, rules []Rule) (string, []Rule, error) {
 		}
 		return a.ID < b.ID
 	})
-	canonical := Snapshot{SchemaVersion: snapshot.SchemaVersion, Version: snapshot.Version, ExpectedCurrentVersion: snapshot.ExpectedCurrentVersion, GeneratedAt: snapshot.GeneratedAt.UTC(), BlockRCode: snapshot.BlockRCode, Rules: canonicalRules}
+	canonical := Snapshot{SchemaVersion: snapshot.SchemaVersion, Version: snapshot.Version, ExpectedCurrentVersion: snapshot.ExpectedCurrentVersion, GeneratedAt: snapshot.GeneratedAt.UTC(), BlockRCode: snapshot.BlockRCode, Rules: rules, SubscriptionSets: sets}
 	b, err := json.Marshal(canonical)
 	if err != nil {
 		return "", nil, fmt.Errorf("marshal canonical snapshot: %w", err)
 	}
 	sum := sha256.Sum256(b)
-	return "sha256:" + hex.EncodeToString(sum[:]), canonicalRules, nil
+	return "sha256:" + hex.EncodeToString(sum[:]), rules, nil
 }
 
 // ParseSnapshot 使用严格 decoder，避免 API 层接受拼写错误或未定义字段。
