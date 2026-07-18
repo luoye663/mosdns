@@ -1,6 +1,9 @@
 package dynamic_rule_engine
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"sync"
 	"testing"
@@ -159,6 +162,25 @@ func TestCompileRejectsLimitsAndChecksumMismatch(t *testing.T) {
 	snapshot.Checksum = "sha256:not-a-real-checksum"
 	if _, err := Compile(snapshot, DefaultLimits()); err == nil {
 		t.Fatal("Compile() error = nil, want checksum mismatch")
+	}
+}
+
+func TestCompileAcceptsChecksummedEmptyRulesArray(t *testing.T) {
+	snapshot := testSnapshot()
+	snapshot.Rules = []Rule{}
+	encoded, err := json.Marshal(snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(encoded)
+	snapshot.Checksum = "sha256:" + hex.EncodeToString(sum[:])
+
+	compiled, err := Compile(snapshot, DefaultLimits())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if compiled.RuleCount() != 0 {
+		t.Fatalf("rule count = %d, want 0", compiled.RuleCount())
 	}
 }
 

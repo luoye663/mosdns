@@ -299,7 +299,9 @@ func validateRouteConflicts(rules []Rule) error {
 }
 
 func checksumSnapshot(snapshot Snapshot, rules []Rule) (string, []Rule, error) {
-	canonicalRules := append([]Rule(nil), rules...)
+	// Preserve an explicit empty array so its checksum matches controller snapshots.
+	canonicalRules := make([]Rule, len(rules))
+	copy(canonicalRules, rules)
 	sort.Slice(canonicalRules, func(i, j int) bool {
 		a, b := canonicalRules[i], canonicalRules[j]
 		if a.Category != b.Category {
