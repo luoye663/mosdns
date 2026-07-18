@@ -71,6 +71,17 @@ func getMsgKey(q *dns.Msg) string {
 	buf[2] = byte(question.Qtype)
 	buf[3] = byte(len(question.Name))
 	copy(buf[4:], question.Name)
+	// ECS changes an upstream's geographic answer. Include it in the key so
+	// clients from distinct anonymous subnets can never share an answer.
+	if opt := q.IsEdns0(); opt != nil {
+		for _, option := range opt.Option {
+			if ecs, ok := option.(*dns.EDNS0_SUBNET); ok {
+				buf = append(buf, byte(ecs.Family>>8), byte(ecs.Family), ecs.SourceNetmask, ecs.SourceScope)
+				buf = append(buf, ecs.Address...)
+				break
+			}
+		}
+	}
 	return utils.BytesToStringUnsafe(buf)
 }
 

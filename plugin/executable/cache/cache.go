@@ -95,6 +95,7 @@ type Cache struct {
 	closeNotify  chan struct{}
 	updatedKey   atomic.Uint64
 	enabled      atomic.Bool
+	lazyCacheTTL atomic.Int64
 	controlToken []byte
 
 	queryTotal   prometheus.Counter
@@ -189,6 +190,7 @@ func NewCache(args *Args, opts Opts) *Cache {
 		}),
 	}
 	p.enabled.Store(true)
+	p.lazyCacheTTL.Store(int64(args.LazyCacheTTL))
 
 	if err := p.loadDump(); err != nil {
 		p.logger.Error("failed to load cache dump", zap.Error(err))
@@ -219,7 +221,8 @@ func (c *Cache) Exec(ctx context.Context, qCtx *query_context.Context, next sequ
 		return next.ExecNext(ctx, qCtx)
 	}
 
-	cachedResp, lazyHit := getRespFromCache(msgKey, c.backend, c.args.LazyCacheTTL > 0, expiredMsgTtl)
+	lazyTTL := int(c.lazyCacheTTL.Load())
+	cachedResp, lazyHit := getRespFromCache(msgKey, c.backend, lazyTTL > 0, expiredMsgTtl)
 	if lazyHit {
 		c.lazyHitTotal.Inc()
 		c.doLazyUpdate(msgKey, qCtx, next)
@@ -233,7 +236,7 @@ func (c *Cache) Exec(ctx context.Context, qCtx *query_context.Context, next sequ
 	err := next.ExecNext(ctx, qCtx)
 
 	if r := qCtx.R(); r != nil && cachedResp != r { // pointer compare. r is not cachedResp
-		saveRespToCache(msgKey, r, c.backend, c.args.LazyCacheTTL)
+		saveRespToCache(msgKey, r, c.backend, lazyTTL)
 		c.updatedKey.Add(1)
 	}
 	return err
@@ -258,7 +261,7 @@ func (c *Cache) doLazyUpdate(msgKey string, qCtx *query_context.Context, next se
 
 		r := qCtx.R()
 		if r != nil {
-			saveRespToCache(msgKey, r, c.backend, c.args.LazyCacheTTL)
+			saveRespToCache(msgKey, r, c.backend, int(c.lazyCacheTTL.Load()))
 			c.updatedKey.Add(1)
 		}
 		c.logger.Debug("lazy cache updated", qCtx.InfoField())
@@ -371,6 +374,21 @@ func (c *Cache) Api() *chi.Mux {
 		}
 		w.Header().Set("content-type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]bool{"enabled": body.Enabled})
+	})
+	r.Put("/ttl", func(w http.ResponseWriter, req *http.Request) {
+		var body struct {
+			TTL int `json:"ttl"`
+		}
+		decoder := json.NewDecoder(io.LimitReader(req.Body, 1025))
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&body); err != nil || decoder.Decode(&struct{}{}) != io.EOF || body.TTL < 0 || body.TTL > 604800 {
+			http.Error(w, "invalid request", http.StatusBadRequest)
+			return
+		}
+		c.lazyCacheTTL.Store(int64(body.TTL))
+		c.backend.Flush()
+		w.Header().Set("content-type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]int{"ttl": body.TTL})
 	})
 	r.Get("/dump", func(w http.ResponseWriter, req *http.Request) {
 		w.Header().Set("content-type", "application/octet-stream")

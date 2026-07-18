@@ -104,3 +104,28 @@ func TestCacheEnabledAPIBypassesAndFlushesCache(t *testing.T) {
 		t.Fatalf("status=%d enabled=%t entries=%d", response.Code, c.enabled.Load(), c.backend.Len())
 	}
 }
+
+func TestCacheKeySeparatesECSSubnets(t *testing.T) {
+	first := new(dns.Msg)
+	first.SetQuestion("example.com.", dns.TypeA)
+	first.SetEdns0(1200, false)
+	first.IsEdns0().Option = append(first.IsEdns0().Option, &dns.EDNS0_SUBNET{Code: dns.EDNS0SUBNET, Family: 1, SourceNetmask: 24, Address: []byte{192, 0, 2, 0}})
+	second := first.Copy()
+	second.IsEdns0().Option[0] = &dns.EDNS0_SUBNET{Code: dns.EDNS0SUBNET, Family: 1, SourceNetmask: 24, Address: []byte{198, 51, 100, 0}}
+	if getMsgKey(first) == getMsgKey(second) {
+		t.Fatal("distinct ECS subnets share a cache key")
+	}
+}
+
+func TestCacheTTLAPIFlushesExistingEntries(t *testing.T) {
+	c := NewCache(&Args{Size: 16}, Opts{})
+	c.controlToken = []byte("cache-test-token")
+	c.backend.Store("entry", &item{}, time.Now().Add(time.Hour))
+	req := httptest.NewRequest(http.MethodPut, "/ttl", bytes.NewBufferString(`{"ttl":60}`))
+	req.Header.Set("Authorization", "Bearer cache-test-token")
+	response := httptest.NewRecorder()
+	c.Api().ServeHTTP(response, req)
+	if response.Code != http.StatusOK || c.lazyCacheTTL.Load() != 60 || c.backend.Len() != 0 {
+		t.Fatalf("status=%d ttl=%d entries=%d", response.Code, c.lazyCacheTTL.Load(), c.backend.Len())
+	}
+}
