@@ -43,7 +43,6 @@ type Marks struct {
 	RouteLocal   uint32 `yaml:"route_local"`
 	RouteRemote  uint32 `yaml:"route_remote"`
 	NoLog        uint32 `yaml:"no_log"`
-	GeoSiteLocal uint32 `yaml:"geosite_local"`
 	CacheHit     uint32 `yaml:"cache_hit"`
 }
 
@@ -222,7 +221,7 @@ func validateArgs(args *Args) error {
 		args.MaxErrorTextBytes = 256
 	}
 	if args.Marks == (Marks{}) {
-		args.Marks = Marks{AccessBlock: 1001, RouteLocal: 1101, RouteRemote: 1102, NoLog: 1201, GeoSiteLocal: 1301, CacheHit: 2101}
+		args.Marks = Marks{AccessBlock: 1001, RouteLocal: 1101, RouteRemote: 1102, NoLog: 1201, CacheHit: 2101}
 	}
 	if args.QueueSize < 1 || args.BatchSize < 1 {
 		return fmt.Errorf("queue_size and batch_size must be greater than zero")
@@ -240,7 +239,7 @@ func validateArgs(args *Args) error {
 		return fmt.Errorf("request_timeout must be a positive duration")
 	}
 	seen := map[uint32]string{}
-	for name, value := range map[string]uint32{"access_block": args.Marks.AccessBlock, "route_local": args.Marks.RouteLocal, "route_remote": args.Marks.RouteRemote, "no_log": args.Marks.NoLog, "geosite_local": args.Marks.GeoSiteLocal, "cache_hit": args.Marks.CacheHit} {
+	for name, value := range map[string]uint32{"access_block": args.Marks.AccessBlock, "route_local": args.Marks.RouteLocal, "route_remote": args.Marks.RouteRemote, "no_log": args.Marks.NoLog, "cache_hit": args.Marks.CacheHit} {
 		if value == 0 {
 			return fmt.Errorf("marks.%s must be greater than zero", name)
 		}
@@ -349,9 +348,6 @@ func answerIPs(response *dns.Msg) []string {
 func (p *Plugin) route(qCtx *query_context.Context) (route, source, upstream string) {
 	if qCtx.HasMark(p.marks.AccessBlock) {
 		return "block", "dynamic_rule", ""
-	}
-	if qCtx.HasMark(p.marks.GeoSiteLocal) {
-		return "local", "geosite", "local_dns"
 	}
 	dynamicSource := false
 	if decision, ok := dynamic_rule_engine.RuntimeDecisionFromContext(qCtx); ok {

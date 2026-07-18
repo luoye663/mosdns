@@ -170,10 +170,6 @@ func startMosdns(t *testing.T, localAddr, remoteAddr string) *mosdnsInstance {
 api:
   http: "127.0.0.1:%d"
 plugins:
-  - tag: geosite_cn
-    type: domain_set
-    args:
-      exps: []
   - tag: dynamic_rules
     type: dynamic_rule_engine
     args:
@@ -256,9 +252,6 @@ plugins:
       - matches:
           - mark 1102
         exec: goto route_remote
-      - matches:
-          - qname $geosite_cn
-        exec: goto route_local
       - exec: goto route_remote
   - tag: udp_server
     type: udp_server
