@@ -143,15 +143,30 @@ func TestBuildEventIncludesOnlyUniqueAnswerIPs(t *testing.T) {
 	response := new(dns.Msg)
 	response.SetReply(qCtx.Q())
 	response.Answer = append(response.Answer,
-		&dns.A{Hdr: dns.RR_Header{Name: "answers.example.", Rrtype: dns.TypeA, Class: dns.ClassINET}, A: net.ParseIP("192.0.2.1")},
-		&dns.AAAA{Hdr: dns.RR_Header{Name: "answers.example.", Rrtype: dns.TypeAAAA, Class: dns.ClassINET}, AAAA: net.ParseIP("2001:db8::1")},
-		&dns.A{Hdr: dns.RR_Header{Name: "answers.example.", Rrtype: dns.TypeA, Class: dns.ClassINET}, A: net.ParseIP("192.0.2.1")},
-		&dns.CNAME{Hdr: dns.RR_Header{Name: "answers.example.", Rrtype: dns.TypeCNAME, Class: dns.ClassINET}, Target: "target.example."},
+		&dns.A{Hdr: dns.RR_Header{Name: "answers.example.", Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 120}, A: net.ParseIP("192.0.2.1")},
+		&dns.AAAA{Hdr: dns.RR_Header{Name: "answers.example.", Rrtype: dns.TypeAAAA, Class: dns.ClassINET, Ttl: 60}, AAAA: net.ParseIP("2001:db8::1")},
+		&dns.A{Hdr: dns.RR_Header{Name: "answers.example.", Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 30}, A: net.ParseIP("192.0.2.1")},
+		&dns.CNAME{Hdr: dns.RR_Header{Name: "answers.example.", Rrtype: dns.TypeCNAME, Class: dns.ClassINET, Ttl: 90}, Target: "target.example."},
 	)
 	qCtx.SetResponse(response)
 	event := p.buildEvent(qCtx, time.Now(), nil)
 	if len(event.AnswerIPs) != 2 || event.AnswerIPs[0] != "192.0.2.1" || event.AnswerIPs[1] != "2001:db8::1" {
 		t.Fatalf("answer IPs = %#v", event.AnswerIPs)
+	}
+	if event.AnswerMinTTLSeconds == nil || *event.AnswerMinTTLSeconds != 30 {
+		t.Fatalf("minimum answer TTL = %v, want 30", event.AnswerMinTTLSeconds)
+	}
+}
+
+func TestBuildEventOmitsMinimumTTLWithoutAnswer(t *testing.T) {
+	p := newTestAuditPlugin(t, "http://127.0.0.1:1", 1, 1)
+	defer p.Close()
+	qCtx := testContext("empty-answer.example")
+	response := new(dns.Msg)
+	response.SetReply(qCtx.Q())
+	qCtx.SetResponse(response)
+	if event := p.buildEvent(qCtx, time.Now(), nil); event.AnswerMinTTLSeconds != nil {
+		t.Fatalf("minimum answer TTL = %v, want nil", event.AnswerMinTTLSeconds)
 	}
 }
 

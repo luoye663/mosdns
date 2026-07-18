@@ -83,6 +83,7 @@ type QueryEvent struct {
 	AccessRuleID           int64    `json:"access_rule_id"`
 	RouteRuleID            int64    `json:"route_rule_id"`
 	AnswerCount            int      `json:"answer_count"`
+	AnswerMinTTLSeconds    *uint32  `json:"answer_min_ttl_seconds"`
 	AnswerIPs              []string `json:"answer_ips,omitempty"`
 	LatencyUS              int64    `json:"latency_us"`
 	ErrorCode              string   `json:"error_code"`
@@ -298,7 +299,24 @@ func (p *Plugin) buildEvent(qCtx *query_context.Context, started time.Time, exec
 	if p.includeAnswers && response != nil {
 		event.AnswerIPs = answerIPs(response)
 	}
+	if response != nil {
+		event.AnswerMinTTLSeconds = answerMinTTLSeconds(response)
+	}
 	return event
+}
+
+// answerMinTTLSeconds captures the shortest final Answer lifetime clients receive.
+func answerMinTTLSeconds(response *dns.Msg) *uint32 {
+	if len(response.Answer) == 0 {
+		return nil
+	}
+	minimum := response.Answer[0].Header().Ttl
+	for _, record := range response.Answer[1:] {
+		if ttl := record.Header().Ttl; ttl < minimum {
+			minimum = ttl
+		}
+	}
+	return &minimum
 }
 
 // answerIPs retains only A and AAAA data for the controller's bounded memory cache.
