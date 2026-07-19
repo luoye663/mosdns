@@ -9,6 +9,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -152,6 +153,9 @@ func TestBuildEventIncludesOnlyUniqueAnswerIPs(t *testing.T) {
 	event := p.buildEvent(qCtx, time.Now(), nil)
 	if len(event.AnswerIPs) != 2 || event.AnswerIPs[0] != "192.0.2.1" || event.AnswerIPs[1] != "2001:db8::1" {
 		t.Fatalf("answer IPs = %#v", event.AnswerIPs)
+	}
+	if len(event.AnswerRecords) != 4 || !strings.Contains(event.AnswerRecords[0], "192.0.2.1") || !strings.Contains(event.AnswerRecords[1], "2001:db8::1") || !strings.Contains(event.AnswerRecords[2], "192.0.2.1") || !strings.Contains(event.AnswerRecords[3], "CNAME") {
+		t.Fatalf("answer records = %#v", event.AnswerRecords)
 	}
 	if event.AnswerMinTTLSeconds == nil || *event.AnswerMinTTLSeconds != 30 {
 		t.Fatalf("minimum answer TTL = %v, want 30", event.AnswerMinTTLSeconds)

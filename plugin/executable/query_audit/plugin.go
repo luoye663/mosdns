@@ -30,9 +30,13 @@ import (
 )
 
 const (
-	PluginType         = "query_audit"
-	eventSchemaVersion = 1
-	shutdownFlushLimit = 2 * time.Second
+	PluginType            = "query_audit"
+	eventSchemaVersion    = 1
+	shutdownFlushLimit    = 2 * time.Second
+	maxAnswerIPs          = 16
+	maxAnswerRecords      = 32
+	maxAnswerRecordBytes  = 1024
+	maxAnswerRecordsBytes = 16 * 1024
 )
 
 var Version = "dev"
@@ -50,7 +54,7 @@ type Marks struct {
 	CacheHit           uint32 `yaml:"cache_hit"`
 }
 
-// Args 是 query_audit 的 YAML 配置；启用 include_answers 时仅携带 A/AAAA 地址。
+// Args 是 query_audit 的 YAML 配置；启用 include_answers 时携带受限的 Answer 区诊断数据。
 type Args struct {
 	Endpoint          string `yaml:"endpoint"`
 	AuthTokenFile     string `yaml:"auth_token_file"`
@@ -91,6 +95,7 @@ type QueryEvent struct {
 	AnswerMinTTLSeconds    *uint32  `json:"answer_min_ttl_seconds"`
 	SubscriptionCategories []string `json:"subscription_categories,omitempty"`
 	AnswerIPs              []string `json:"answer_ips,omitempty"`
+	AnswerRecords          []string `json:"answer_records,omitempty"`
 	LatencyUS              int64    `json:"latency_us"`
 	ErrorCode              string   `json:"error_code"`
 	ErrorText              string   `json:"error_text"`
@@ -313,6 +318,7 @@ func (p *Plugin) buildEvent(qCtx *query_context.Context, started time.Time, exec
 	}
 	if p.includeAnswers && response != nil {
 		event.AnswerIPs = answerIPs(response)
+		event.AnswerRecords = answerRecords(response)
 	}
 	if response != nil {
 		event.AnswerMinTTLSeconds = answerMinTTLSeconds(response)
@@ -336,7 +342,6 @@ func answerMinTTLSeconds(response *dns.Msg) *uint32 {
 
 // answerIPs retains only A and AAAA data for the controller's bounded memory cache.
 func answerIPs(response *dns.Msg) []string {
-	const maxAnswerIPs = 16
 	ips := make([]string, 0, maxAnswerIPs)
 	seen := make(map[string]struct{}, maxAnswerIPs)
 	for _, record := range response.Answer {
@@ -359,6 +364,21 @@ func answerIPs(response *dns.Msg) []string {
 		}
 	}
 	return ips
+}
+
+// answerRecords preserves Answer order for short-lived diagnostics without retaining a DNS packet.
+func answerRecords(response *dns.Msg) []string {
+	records := make([]string, 0, min(len(response.Answer), maxAnswerRecords))
+	remaining := maxAnswerRecordsBytes
+	for _, record := range response.Answer {
+		if len(records) == maxAnswerRecords || remaining == 0 {
+			break
+		}
+		value := truncate(record.String(), min(maxAnswerRecordBytes, remaining))
+		records = append(records, value)
+		remaining -= len(value)
+	}
+	return records
 }
 
 func (p *Plugin) route(qCtx *query_context.Context) (route, source, upstream string) {
