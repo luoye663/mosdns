@@ -248,6 +248,9 @@ func (p *Plugin) Exec(_ context.Context, qCtx *query_context.Context) error {
 	if result.Access.Action == ActionBlock {
 		qCtx.SetMark(p.marks.AccessBlock)
 	}
+	if result.Access.Action == ActionAllow {
+		qCtx.SetMark(p.marks.AccessAllow)
+	}
 	if result.Route.Action == ActionLocal {
 		qCtx.SetMark(p.marks.RouteLocal)
 		decision.RouteSource = "dynamic_rule"

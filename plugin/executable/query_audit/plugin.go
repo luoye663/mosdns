@@ -39,11 +39,14 @@ var Version = "dev"
 
 // Marks 统一定义审计读取的 marks，启动时会检查彼此不冲突。
 type Marks struct {
-	AccessBlock uint32 `yaml:"access_block"`
-	RouteLocal  uint32 `yaml:"route_local"`
-	RouteRemote uint32 `yaml:"route_remote"`
-	NoLog       uint32 `yaml:"no_log"`
-	CacheHit    uint32 `yaml:"cache_hit"`
+	AccessBlock        uint32 `yaml:"access_block"`
+	RouteLocal         uint32 `yaml:"route_local"`
+	RouteRemote        uint32 `yaml:"route_remote"`
+	NoLog              uint32 `yaml:"no_log"`
+	SubscriptionLocal  uint32 `yaml:"subscription_local"`
+	SubscriptionRemote uint32 `yaml:"subscription_remote"`
+	SubscriptionBlock  uint32 `yaml:"subscription_block"`
+	CacheHit           uint32 `yaml:"cache_hit"`
 }
 
 // Args 是 query_audit 的 YAML 配置；启用 include_answers 时仅携带 A/AAAA 地址。
@@ -223,7 +226,7 @@ func validateArgs(args *Args) error {
 		args.MaxErrorTextBytes = 256
 	}
 	if args.Marks == (Marks{}) {
-		args.Marks = Marks{AccessBlock: 1001, RouteLocal: 1101, RouteRemote: 1102, NoLog: 1201, CacheHit: 2101}
+		args.Marks = Marks{AccessBlock: 1001, RouteLocal: 1101, RouteRemote: 1102, NoLog: 1201, SubscriptionLocal: 1301, SubscriptionRemote: 1302, SubscriptionBlock: 1303, CacheHit: 2101}
 	}
 	if args.QueueSize < 1 || args.BatchSize < 1 {
 		return fmt.Errorf("queue_size and batch_size must be greater than zero")
@@ -241,7 +244,7 @@ func validateArgs(args *Args) error {
 		return fmt.Errorf("request_timeout must be a positive duration")
 	}
 	seen := map[uint32]string{}
-	for name, value := range map[string]uint32{"access_block": args.Marks.AccessBlock, "route_local": args.Marks.RouteLocal, "route_remote": args.Marks.RouteRemote, "no_log": args.Marks.NoLog, "cache_hit": args.Marks.CacheHit} {
+	for name, value := range map[string]uint32{"access_block": args.Marks.AccessBlock, "route_local": args.Marks.RouteLocal, "route_remote": args.Marks.RouteRemote, "no_log": args.Marks.NoLog, "subscription_local": args.Marks.SubscriptionLocal, "subscription_remote": args.Marks.SubscriptionRemote, "subscription_block": args.Marks.SubscriptionBlock, "cache_hit": args.Marks.CacheHit} {
 		if value == 0 {
 			return fmt.Errorf("marks.%s must be greater than zero", name)
 		}
@@ -350,6 +353,9 @@ func answerIPs(response *dns.Msg) []string {
 
 func (p *Plugin) route(qCtx *query_context.Context) (route, source, upstream string) {
 	if qCtx.HasMark(p.marks.AccessBlock) {
+		if qCtx.HasMark(p.marks.SubscriptionBlock) {
+			return "block", "subscription", ""
+		}
 		return "block", "dynamic_rule", ""
 	}
 	dynamicSource := false
@@ -357,12 +363,18 @@ func (p *Plugin) route(qCtx *query_context.Context) (route, source, upstream str
 		dynamicSource = decision.RouteSource == "dynamic_rule"
 	}
 	if qCtx.HasMark(p.marks.RouteLocal) {
+		if qCtx.HasMark(p.marks.SubscriptionLocal) {
+			return "local", "subscription", "local_dns"
+		}
 		if dynamicSource {
 			return "local", "dynamic_rule", "local_dns"
 		}
 		return "local", "default", "local_dns"
 	}
 	if qCtx.HasMark(p.marks.RouteRemote) {
+		if qCtx.HasMark(p.marks.SubscriptionRemote) {
+			return "remote", "subscription", "remote_dns"
+		}
 		if dynamicSource {
 			return "remote", "dynamic_rule", "remote_dns"
 		}
