@@ -46,6 +46,7 @@ type Marks struct {
 	SubscriptionLocal  uint32 `yaml:"subscription_local"`
 	SubscriptionRemote uint32 `yaml:"subscription_remote"`
 	SubscriptionBlock  uint32 `yaml:"subscription_block"`
+	SubscriptionAllow  uint32 `yaml:"subscription_allow"`
 	CacheHit           uint32 `yaml:"cache_hit"`
 }
 
@@ -88,6 +89,7 @@ type QueryEvent struct {
 	SubscriptionSourceName string   `json:"subscription_source_name"`
 	AnswerCount            int      `json:"answer_count"`
 	AnswerMinTTLSeconds    *uint32  `json:"answer_min_ttl_seconds"`
+	SubscriptionCategories []string `json:"subscription_categories,omitempty"`
 	AnswerIPs              []string `json:"answer_ips,omitempty"`
 	LatencyUS              int64    `json:"latency_us"`
 	ErrorCode              string   `json:"error_code"`
@@ -226,7 +228,7 @@ func validateArgs(args *Args) error {
 		args.MaxErrorTextBytes = 256
 	}
 	if args.Marks == (Marks{}) {
-		args.Marks = Marks{AccessBlock: 1001, RouteLocal: 1101, RouteRemote: 1102, NoLog: 1201, SubscriptionLocal: 1301, SubscriptionRemote: 1302, SubscriptionBlock: 1303, CacheHit: 2101}
+		args.Marks = Marks{AccessBlock: 1001, RouteLocal: 1101, RouteRemote: 1102, NoLog: 1201, SubscriptionLocal: 1301, SubscriptionRemote: 1302, SubscriptionBlock: 1303, SubscriptionAllow: 1304, CacheHit: 2101}
 	}
 	if args.QueueSize < 1 || args.BatchSize < 1 {
 		return fmt.Errorf("queue_size and batch_size must be greater than zero")
@@ -244,7 +246,7 @@ func validateArgs(args *Args) error {
 		return fmt.Errorf("request_timeout must be a positive duration")
 	}
 	seen := map[uint32]string{}
-	for name, value := range map[string]uint32{"access_block": args.Marks.AccessBlock, "route_local": args.Marks.RouteLocal, "route_remote": args.Marks.RouteRemote, "no_log": args.Marks.NoLog, "subscription_local": args.Marks.SubscriptionLocal, "subscription_remote": args.Marks.SubscriptionRemote, "subscription_block": args.Marks.SubscriptionBlock, "cache_hit": args.Marks.CacheHit} {
+	for name, value := range map[string]uint32{"access_block": args.Marks.AccessBlock, "route_local": args.Marks.RouteLocal, "route_remote": args.Marks.RouteRemote, "no_log": args.Marks.NoLog, "subscription_local": args.Marks.SubscriptionLocal, "subscription_remote": args.Marks.SubscriptionRemote, "subscription_block": args.Marks.SubscriptionBlock, "subscription_allow": args.Marks.SubscriptionAllow, "cache_hit": args.Marks.CacheHit} {
 		if value == 0 {
 			return fmt.Errorf("marks.%s must be greater than zero", name)
 		}
@@ -287,6 +289,14 @@ func (p *Plugin) buildEvent(qCtx *query_context.Context, started time.Time, exec
 		ClientIP: qCtx.ServerMeta.ClientAddr.String(), Protocol: protocol(qCtx), QName: normalizeQName(question.Name), QType: question.Qtype, QClass: question.Qclass,
 		RCode: rcode, Route: route, RouteSource: routeSource, UpstreamGroup: upstream, UpstreamTag: fastforward.SelectedUpstreamTag(qCtx), CacheHit: qCtx.HasMark(p.marks.CacheHit),
 		AnswerCount: answerCount, LatencyUS: time.Since(started).Microseconds(),
+	}
+	for _, category := range []struct {
+		mark uint32
+		name string
+	}{{p.marks.SubscriptionAllow, "allow"}, {p.marks.SubscriptionBlock, "block"}, {p.marks.SubscriptionLocal, "local"}, {p.marks.SubscriptionRemote, "remote"}} {
+		if qCtx.HasMark(category.mark) {
+			event.SubscriptionCategories = append(event.SubscriptionCategories, category.name)
+		}
 	}
 	if decision, ok := dynamic_rule_engine.RuntimeDecisionFromContext(qCtx); ok {
 		event.SnapshotVersion, event.AccessRuleID, event.RouteRuleID = decision.SnapshotVersion, decision.AccessRuleID, decision.RouteRuleID

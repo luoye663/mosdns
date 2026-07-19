@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -67,6 +68,8 @@ type Plugin struct {
 	backupFile   string
 	maxBytes     int64
 }
+
+var memorySweepScheduled atomic.Bool
 
 var _ data_provider.DomainMatcherProvider = (*Plugin)(nil)
 
@@ -219,7 +222,21 @@ func (p *Plugin) handleSnapshot(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	p.current.Store(next)
+	scheduleMemorySweep()
 	p.handleStatus(w, r)
+}
+
+// Large source updates temporarily retain both matchers while compiling. Run a
+// coalesced control-plane sweep after the pointer swap so unused heap pages can
+// be returned without delaying DNS execution or the API response.
+func scheduleMemorySweep() {
+	if !memorySweepScheduled.CompareAndSwap(false, true) {
+		return
+	}
+	go func() {
+		defer memorySweepScheduled.Store(false)
+		debug.FreeOSMemory()
+	}()
 }
 
 func persist(snapshot Snapshot, currentFile, backupFile string) error {
