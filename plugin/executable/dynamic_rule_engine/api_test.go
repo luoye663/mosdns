@@ -78,7 +78,7 @@ func TestAPIAuthenticationApplyAndStatusReconcile(t *testing.T) {
 	if err := json.NewDecoder(response.Body).Decode(&status); err != nil {
 		t.Fatal(err)
 	}
-	if status.State != "ready" || status.SnapshotVersion != 1 || !status.SnapshotFileOK {
+	if status.State != "ready" || status.SnapshotVersion != 1 || !status.SnapshotFileOK || status.MemoryRSSBytes <= 0 {
 		t.Fatalf("unexpected runtime status: %+v", status)
 	}
 }

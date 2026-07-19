@@ -44,6 +44,7 @@ func (p *Plugin) handleStatus(w http.ResponseWriter, _ *http.Request) {
 		SchemaVersion: SchemaVersion, PluginVersion: Version, MosdnsBase: "v5.3.4",
 		State: p.state(), SnapshotFileOK: p.snapshotFileOK.Load(),
 		LastCompileDurationMS: p.lastCompileDuration.Load(),
+		MemoryRSSBytes:        processRSSBytes(),
 	}
 	if snapshot != nil {
 		response.SnapshotVersion = snapshot.Version()
@@ -190,6 +191,7 @@ type statusResponse struct {
 	LoadedAt              time.Time `json:"loaded_at,omitempty"`
 	LastCompileDurationMS int64     `json:"last_compile_duration_ms"`
 	SnapshotFileOK        bool      `json:"snapshot_file_ok"`
+	MemoryRSSBytes        int64     `json:"memory_rss_bytes"`
 }
 
 type validateResponse struct {
