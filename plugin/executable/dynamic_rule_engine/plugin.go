@@ -244,7 +244,20 @@ func (p *Plugin) Exec(_ context.Context, qCtx *query_context.Context) error {
 		return nil
 	} // 非法 QNAME 不影响 DNS 主链路。
 	p.recordMatch(result)
-	decision := RuntimeDecision{SnapshotVersion: result.SnapshotVersion, AccessRuleID: result.Access.RuleID, RouteRuleID: result.Route.RuleID, LoggingRuleID: result.Logging.RuleID, AccessAction: result.Access.Action, RouteAction: result.Route.Action, SubscriptionSourceID: result.Route.SourceID, SubscriptionSourceName: result.Route.SourceName}
+	decision := RuntimeDecision{
+		SnapshotVersion: result.SnapshotVersion, AccessRuleID: result.Access.RuleID, RouteRuleID: result.Route.RuleID, LoggingRuleID: result.Logging.RuleID,
+		AccessAction: result.Access.Action, RouteAction: result.Route.Action,
+		SubscriptionSourceID: result.Route.SourceID, SubscriptionSourceName: result.Route.SourceName, BindingID: result.Route.BindingID, UpstreamGroupID: result.Route.UpstreamGroupID,
+		AccessSubscriptionSourceID: result.Access.SourceID, AccessSubscriptionSourceName: result.Access.SourceName,
+		RouteSubscriptionSourceID: result.Route.SourceID, RouteSubscriptionSourceName: result.Route.SourceName,
+		RouteSubscriptionBindingID: result.Route.BindingID, RouteSubscriptionUpstreamGroupID: result.Route.UpstreamGroupID,
+	}
+	if result.Access.SourceID != 0 {
+		decision.AccessSubscriptionAction = result.Access.Action
+	}
+	if result.Route.SourceID != 0 {
+		decision.RouteSubscriptionAction = result.Route.Action
+	}
 	if result.Access.Action == ActionBlock {
 		qCtx.SetMark(p.marks.AccessBlock)
 	}
@@ -258,6 +271,10 @@ func (p *Plugin) Exec(_ context.Context, qCtx *query_context.Context) error {
 	if result.Route.Action == ActionRemote {
 		qCtx.SetMark(p.marks.RouteRemote)
 		decision.RouteSource = "dynamic_rule"
+	}
+	if result.Route.Action == ActionUpstream {
+		query_context.SetUpstreamGroupID(qCtx, result.Route.UpstreamGroupID)
+		decision.RouteSource = "subscription"
 	}
 	if result.Logging.Action == ActionNoLog {
 		qCtx.SetMark(p.marks.NoLog)

@@ -57,7 +57,8 @@ func apiRequest(t *testing.T, p *Plugin, method, path string, body any, token st
 func phase3Snapshot(version, expected uint64) Snapshot {
 	return Snapshot{
 		SchemaVersion: SchemaVersion, Version: version, ExpectedCurrentVersion: expected, BlockRCode: dns.RcodeNameError,
-		Rules: []Rule{{ID: int64(version), Category: CategoryAccess, Action: ActionBlock, MatchType: MatchTypeFull, Pattern: "blocked.example"}},
+		Rules:            []Rule{{ID: int64(version), Category: CategoryAccess, Action: ActionBlock, MatchType: MatchTypeFull, Pattern: "blocked.example"}},
+		SubscriptionSets: []SubscriptionSet{routeBinding(1000+int64(version), int64(version), "published_group", 1, "blocked.example")},
 	}
 }
 
@@ -178,6 +179,59 @@ func TestExecWritesMarksAndRuntimeMetadata(t *testing.T) {
 	decision, ok := RuntimeDecisionFromContext(qCtx)
 	if !ok || decision.SnapshotVersion != 1 || decision.AccessRuleID != 1 || decision.RouteRuleID != 2 || decision.LoggingRuleID != 3 {
 		t.Fatalf("runtime decision = %+v, present=%t", decision, ok)
+	}
+}
+
+func TestExecWritesV3BindingWithoutRouteMarks(t *testing.T) {
+	p, _ := newTestPlugin(t, true)
+	snapshot := testSnapshot()
+	snapshot.SubscriptionSets = []SubscriptionSet{routeBinding(7, 11, "custom_group", 1, "example.com")}
+	compiled, err := Compile(snapshot, p.limits)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.store.Swap(compiled)
+	message := new(dns.Msg)
+	message.SetQuestion("www.example.com.", dns.TypeA)
+	qCtx := query_context.NewContext(message)
+	if err := p.Exec(t.Context(), qCtx); err != nil {
+		t.Fatal(err)
+	}
+	groupID, ok := query_context.UpstreamGroupID(qCtx)
+	decision, decisionOK := RuntimeDecisionFromContext(qCtx)
+	if !ok || groupID != "custom_group" || !decisionOK || decision.RouteSource != "subscription" || decision.BindingID != 11 || decision.UpstreamGroupID != "custom_group" {
+		t.Fatalf("group=%q ok=%t decision=%+v present=%t", groupID, ok, decision, decisionOK)
+	}
+	if qCtx.HasMark(p.marks.RouteLocal) || qCtx.HasMark(p.marks.RouteRemote) {
+		t.Fatal("v3 binding wrote a local/remote route mark")
+	}
+}
+
+func TestV3BindingCASPersistenceAndMatchAPI(t *testing.T) {
+	p, args := newTestPlugin(t, true)
+	snapshot := testSnapshot()
+	snapshot.SubscriptionSets = []SubscriptionSet{routeBinding(7, 11, "custom_group", 1, "example.com")}
+	if response := apiRequest(t, p, http.MethodPut, "/snapshot", snapshot, "test-token"); response.Code != http.StatusOK {
+		t.Fatalf("apply status = %d: %s", response.Code, response.Body.String())
+	}
+	snapshot.Version = 2
+	snapshot.ExpectedCurrentVersion = 0
+	snapshot.Checksum = ""
+	if response := apiRequest(t, p, http.MethodPut, "/snapshot", snapshot, "test-token"); response.Code != http.StatusConflict {
+		t.Fatalf("stale apply status = %d", response.Code)
+	}
+	data, err := os.ReadFile(args.SnapshotFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	persisted, err := ParseSnapshot(data)
+	if err != nil || len(persisted.SubscriptionSets) != 1 || persisted.SubscriptionSets[0].BindingID != 11 || persisted.SubscriptionSets[0].UpstreamGroupID != "custom_group" || persisted.Checksum == "" {
+		t.Fatalf("persisted snapshot = %+v, err=%v", persisted, err)
+	}
+	response := apiRequest(t, p, http.MethodPost, "/match", matchRequest{QName: "www.example.com"}, "test-token")
+	var matched matchResponse
+	if response.Code != http.StatusOK || json.NewDecoder(response.Body).Decode(&matched) != nil || matched.Route.SubscriptionBindingID != 11 || matched.Route.UpstreamGroupID != "custom_group" || matched.Route.Source != "subscription" {
+		t.Fatalf("match response status=%d value=%+v body=%s", response.Code, matched, response.Body.String())
 	}
 }
 

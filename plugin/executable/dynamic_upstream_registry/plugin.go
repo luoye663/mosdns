@@ -256,12 +256,12 @@ func (p *Plugin) Exec(ctx context.Context, qCtx *query_context.Context) error {
 	}
 	defer p.release(state)
 	groupID, source := state.snapshot.DefaultGroupID, "default"
-	if explicit, ok := query_context.UpstreamGroupID(qCtx); ok {
-		groupID, source = explicit, "subscription"
-	} else if decision, ok := dynamic_rule_engine.RuntimeDecisionFromContext(qCtx); ok && decision.RouteAction == dynamic_rule_engine.ActionLocal {
+	if decision, ok := dynamic_rule_engine.RuntimeDecisionFromContext(qCtx); ok && decision.RouteAction == dynamic_rule_engine.ActionLocal {
 		groupID, source = "local_dns", "dynamic_rule"
 	} else if decision, ok := dynamic_rule_engine.RuntimeDecisionFromContext(qCtx); ok && decision.RouteAction == dynamic_rule_engine.ActionRemote {
 		groupID, source = "remote_dns", "dynamic_rule"
+	} else if explicit, ok := query_context.UpstreamGroupID(qCtx); ok {
+		groupID, source = explicit, "subscription"
 	} else if qCtx.HasMark(subscriptionLocalMark) {
 		groupID, source = "local_dns", "subscription"
 	} else if qCtx.HasMark(subscriptionRemoteMark) {

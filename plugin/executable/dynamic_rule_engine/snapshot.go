@@ -3,17 +3,18 @@ package dynamic_rule_engine
 import "time"
 
 const (
-	SchemaVersion = 2
+	SchemaVersion = 3
 
 	CategoryAccess  = "access"
 	CategoryRoute   = "route"
 	CategoryLogging = "logging"
 
-	ActionAllow  = "allow"
-	ActionBlock  = "block"
-	ActionLocal  = "local"
-	ActionRemote = "remote"
-	ActionNoLog  = "no_log"
+	ActionAllow    = "allow"
+	ActionBlock    = "block"
+	ActionLocal    = "local"
+	ActionRemote   = "remote"
+	ActionUpstream = "upstream"
+	ActionNoLog    = "no_log"
 
 	MatchTypeFull   = "full"
 	MatchTypeDomain = "domain"
@@ -55,12 +56,14 @@ type Snapshot struct {
 // intentionally separate from Rule so large source files do not become a
 // database row and runtime object per domain.
 type SubscriptionSet struct {
-	SourceID   int64    `json:"source_id"`
-	SourceName string   `json:"source_name"`
-	Category   string   `json:"category"`
-	Action     string   `json:"action"`
-	Priority   int      `json:"priority"`
-	Domains    []string `json:"domains"`
+	SourceID        int64    `json:"source_id"`
+	SourceName      string   `json:"source_name"`
+	BindingID       int64    `json:"binding_id,omitempty"`
+	UpstreamGroupID string   `json:"upstream_group_id,omitempty"`
+	Category        string   `json:"category"`
+	Action          string   `json:"action"`
+	Priority        int      `json:"priority"`
+	Domains         []string `json:"domains"`
 }
 
 // Rule 保留发布快照中需要审计和确定性排序的全部字段。
@@ -77,13 +80,15 @@ type Rule struct {
 
 // MatchedRule 是请求匹配结果中可安全传递到后续审计阶段的不可变值。
 type MatchedRule struct {
-	RuleID     int64
-	Action     string
-	MatchType  string
-	Pattern    string
-	Priority   int
-	SourceID   int64
-	SourceName string
+	RuleID          int64
+	Action          string
+	MatchType       string
+	Pattern         string
+	Priority        int
+	SourceID        int64
+	SourceName      string
+	BindingID       int64
+	UpstreamGroupID string
 }
 
 func (m MatchedRule) Matched() bool {
@@ -102,13 +107,23 @@ type MatchResult struct {
 // RuntimeDecision 是绑定到单个 DNS 请求生命周期的只读决策信息。
 // query_audit 在后置阶段读取它，不能在写入后修改。
 type RuntimeDecision struct {
-	SnapshotVersion        uint64
-	AccessRuleID           int64
-	RouteRuleID            int64
-	LoggingRuleID          int64
-	AccessAction           string
-	RouteAction            string
-	RouteSource            string
-	SubscriptionSourceID   int64
-	SubscriptionSourceName string
+	SnapshotVersion                  uint64
+	AccessRuleID                     int64
+	RouteRuleID                      int64
+	LoggingRuleID                    int64
+	AccessAction                     string
+	RouteAction                      string
+	RouteSource                      string
+	SubscriptionSourceID             int64
+	SubscriptionSourceName           string
+	BindingID                        int64
+	UpstreamGroupID                  string
+	AccessSubscriptionSourceID       int64
+	AccessSubscriptionSourceName     string
+	AccessSubscriptionAction         string
+	RouteSubscriptionSourceID        int64
+	RouteSubscriptionSourceName      string
+	RouteSubscriptionAction          string
+	RouteSubscriptionBindingID       int64
+	RouteSubscriptionUpstreamGroupID string
 }

@@ -225,6 +225,8 @@ type matchEffectResponse struct {
 	Source                 string `json:"source,omitempty"`
 	SubscriptionSourceID   int64  `json:"subscription_source_id,omitempty"`
 	SubscriptionSourceName string `json:"subscription_source_name,omitempty"`
+	SubscriptionBindingID  int64  `json:"subscription_binding_id,omitempty"`
+	UpstreamGroupID        string `json:"upstream_group_id,omitempty"`
 }
 
 type matchResponse struct {
@@ -242,5 +244,8 @@ func matchEffect(rule MatchedRule, source string) matchEffectResponse {
 		}
 		return matchEffectResponse{Decision: "none"}
 	}
-	return matchEffectResponse{Decision: rule.Action, RuleID: rule.RuleID, MatchType: rule.MatchType, Pattern: rule.Pattern, Source: source, SubscriptionSourceID: rule.SourceID, SubscriptionSourceName: rule.SourceName}
+	if rule.SourceID != 0 {
+		source = "subscription"
+	}
+	return matchEffectResponse{Decision: rule.Action, RuleID: rule.RuleID, MatchType: rule.MatchType, Pattern: rule.Pattern, Source: source, SubscriptionSourceID: rule.SourceID, SubscriptionSourceName: rule.SourceName, SubscriptionBindingID: rule.BindingID, UpstreamGroupID: rule.UpstreamGroupID}
 }

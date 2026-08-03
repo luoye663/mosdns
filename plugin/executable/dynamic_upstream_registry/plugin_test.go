@@ -16,9 +16,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/IrineSistiana/mosdns/v5/coremain"
 	"github.com/IrineSistiana/mosdns/v5/pkg/query_context"
 	"github.com/IrineSistiana/mosdns/v5/plugin/executable/dynamic_ecs"
 	"github.com/IrineSistiana/mosdns/v5/plugin/executable/dynamic_forward"
+	"github.com/IrineSistiana/mosdns/v5/plugin/executable/dynamic_rule_engine"
 	"github.com/miekg/dns"
 	"go.uber.org/zap"
 )
@@ -200,6 +202,52 @@ func TestSelectionPriorityAndMetadata(t *testing.T) {
 				t.Fatalf("metadata = %+v, ok=%v", meta, ok)
 			}
 		})
+	}
+}
+
+func TestManualRuntimeDecisionWinsExplicitSubscriptionGroup(t *testing.T) {
+	local := startDNSServer(t, "192.0.2.2", dns.RcodeSuccess, nil)
+	custom := startDNSServer(t, "192.0.2.4", dns.RcodeSuccess, nil)
+	p, _ := newTestPlugin(t, snapshot(1, group("local_dns", "Local", local.addr), group("custom", "Custom", custom.addr)))
+
+	dir := t.TempDir()
+	tokenFile := filepath.Join(dir, "rule-token")
+	snapshotFile := filepath.Join(dir, "rules.json")
+	if err := os.WriteFile(tokenFile, []byte("rule-token"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ruleSnapshot := dynamic_rule_engine.Snapshot{
+		SchemaVersion: dynamic_rule_engine.SchemaVersion, Version: 1, BlockRCode: dns.RcodeNameError,
+		Rules: []dynamic_rule_engine.Rule{{ID: 1, Category: dynamic_rule_engine.CategoryRoute, Action: dynamic_rule_engine.ActionLocal, MatchType: dynamic_rule_engine.MatchTypeFull, Pattern: "manual.example"}},
+	}
+	data, err := json.Marshal(ruleSnapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(snapshotFile, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	m := coremain.NewTestMosdnsWithPlugins(nil)
+	raw, err := dynamic_rule_engine.Init(coremain.NewBP("registry-priority-rules", m), &dynamic_rule_engine.Args{
+		SnapshotFile: snapshotFile, BackupFile: filepath.Join(dir, "rules.bak"), AuthTokenFile: tokenFile,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	engine := raw.(*dynamic_rule_engine.Plugin)
+	defer engine.Close()
+
+	qCtx := query("manual.example.")
+	query_context.SetUpstreamGroupID(qCtx, "custom")
+	if err := engine.Exec(t.Context(), qCtx); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.Exec(t.Context(), qCtx); err != nil {
+		t.Fatal(err)
+	}
+	meta, ok := query_context.UpstreamRuntimeMetaFromContext(qCtx)
+	if got := answerIP(t, qCtx); got != "192.0.2.2" || !ok || meta.GroupID != "local_dns" || meta.RouteSource != "dynamic_rule" {
+		t.Fatalf("answer=%s metadata=%+v present=%t", got, meta, ok)
 	}
 }
 

@@ -77,6 +77,7 @@ func TestAccessAllowWinsExactTie(t *testing.T) {
 
 func TestSubscriptionSetMatchesSuffixAndReportsSource(t *testing.T) {
 	snapshot := testSnapshot()
+	snapshot.SchemaVersion = 2
 	snapshot.SubscriptionSets = []SubscriptionSet{{SourceID: 42, SourceName: "domestic-list", Category: CategoryRoute, Action: ActionLocal, Priority: 100, Domains: []string{"example.cn", "api.example.cn"}}}
 	compiled, err := Compile(snapshot, DefaultLimits())
 	if err != nil {
@@ -85,6 +86,218 @@ func TestSubscriptionSetMatchesSuffixAndReportsSource(t *testing.T) {
 	matched, err := compiled.Match("www.api.example.cn")
 	if err != nil || matched.Route.SourceID != 42 || matched.Route.SourceName != "domestic-list" || matched.Route.Action != ActionLocal {
 		t.Fatalf("match=%+v err=%v", matched, err)
+	}
+}
+
+func routeBinding(sourceID, bindingID int64, group string, priority int, domains ...string) SubscriptionSet {
+	return SubscriptionSet{SourceID: sourceID, SourceName: fmt.Sprintf("source-%d", sourceID), BindingID: bindingID, UpstreamGroupID: group, Category: CategoryRoute, Action: ActionUpstream, Priority: priority, Domains: domains}
+}
+
+func TestV2SubscriptionCompatibility(t *testing.T) {
+	snapshot := testSnapshot()
+	snapshot.SchemaVersion = 2
+	snapshot.SubscriptionSets = []SubscriptionSet{
+		{SourceID: 1, SourceName: "route", Category: CategoryRoute, Action: ActionRemote, Priority: 50, Domains: []string{"route.example"}},
+		{SourceID: 2, SourceName: "access", Category: CategoryAccess, Action: ActionAllow, Priority: 20, Domains: []string{"access.example"}},
+	}
+	compiled, err := Compile(snapshot, DefaultLimits())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result, _ := compiled.Match("www.route.example"); result.Route.Action != ActionRemote || result.Route.SourceID != 1 {
+		t.Fatalf("v2 route = %+v", result.Route)
+	}
+	if result, _ := compiled.Match("www.access.example"); result.Access.Action != ActionAllow || result.Access.SourceID != 2 {
+		t.Fatalf("v2 access = %+v", result.Access)
+	}
+}
+
+func TestLegacySchemaCanonicalPersistenceRoundTrip(t *testing.T) {
+	for _, schemaVersion := range []uint32{1, 2} {
+		snapshot := testSnapshot(Rule{ID: 1, Category: CategoryAccess, Action: ActionBlock, MatchType: MatchTypeFull, Pattern: "legacy.example"})
+		snapshot.SchemaVersion = schemaVersion
+		canonical, compiled, err := canonicalSnapshot(snapshot, DefaultLimits())
+		if err != nil {
+			t.Fatalf("schema %d canonical snapshot: %v", schemaVersion, err)
+		}
+		data, err := marshalSnapshot(canonical)
+		if err != nil {
+			t.Fatalf("schema %d marshal snapshot: %v", schemaVersion, err)
+		}
+		parsed, err := ParseSnapshot(data)
+		if err != nil {
+			t.Fatalf("schema %d parse persisted snapshot: %v", schemaVersion, err)
+		}
+		reloaded, err := Compile(parsed, DefaultLimits())
+		if err != nil {
+			t.Fatalf("schema %d compile persisted snapshot: %v", schemaVersion, err)
+		}
+		if reloaded.SchemaVersion() != schemaVersion || reloaded.Checksum() != compiled.Checksum() {
+			t.Fatalf("schema %d round trip = version %d checksum %q", schemaVersion, reloaded.SchemaVersion(), reloaded.Checksum())
+		}
+	}
+}
+
+func TestV3RouteBindingValidation(t *testing.T) {
+	tests := []SubscriptionSet{
+		routeBinding(1, 0, "custom", 10, "example.com"),
+		routeBinding(1, 1, "UPPER", 10, "example.com"),
+		routeBinding(1, 1, "-invalid", 10, "example.com"),
+		{SourceID: 1, SourceName: "legacy", Category: CategoryRoute, Action: ActionLocal, Domains: []string{"example.com"}},
+	}
+	for _, set := range tests {
+		snapshot := testSnapshot()
+		snapshot.SubscriptionSets = []SubscriptionSet{set}
+		if _, err := Compile(snapshot, DefaultLimits()); err == nil {
+			t.Fatalf("invalid v3 binding accepted: %+v", set)
+		}
+	}
+
+	for name, sets := range map[string][]SubscriptionSet{
+		"source":  {routeBinding(1, 1, "one", 1, "one.example"), routeBinding(1, 2, "two", 1, "two.example")},
+		"binding": {routeBinding(1, 1, "one", 1, "one.example"), routeBinding(2, 1, "two", 1, "two.example")},
+	} {
+		snapshot := testSnapshot()
+		snapshot.SubscriptionSets = sets
+		if _, err := Compile(snapshot, DefaultLimits()); err == nil {
+			t.Fatalf("duplicate %s ID accepted", name)
+		}
+	}
+	nonRoute := testSnapshot()
+	nonRoute.SubscriptionSets = []SubscriptionSet{{SourceID: 1, SourceName: "access", Category: CategoryAccess, Action: ActionBlock, BindingID: 1, UpstreamGroupID: "custom", Domains: []string{"example.com"}}}
+	if _, err := Compile(nonRoute, DefaultLimits()); err == nil {
+		t.Fatal("binding fields on access subscription accepted")
+	}
+	legacy := testSnapshot()
+	legacy.SchemaVersion = 2
+	legacy.SubscriptionSets = []SubscriptionSet{{SourceID: 1, SourceName: "route", Category: CategoryRoute, Action: ActionLocal, BindingID: 1, UpstreamGroupID: "custom", Domains: []string{"example.com"}}}
+	if _, err := Compile(legacy, DefaultLimits()); err == nil {
+		t.Fatal("v3 binding fields in legacy schema accepted")
+	}
+}
+
+func TestV3ManualRouteAlwaysOverridesBinding(t *testing.T) {
+	for _, rule := range []Rule{
+		{ID: 1, Category: CategoryRoute, Action: ActionLocal, MatchType: MatchTypeFull, Pattern: "www.example.com"},
+		{ID: 2, Category: CategoryRoute, Action: ActionRemote, MatchType: MatchTypeDomain, Pattern: "example.com"},
+		{ID: 3, Category: CategoryRoute, Action: ActionLocal, MatchType: MatchTypeRegexp, Pattern: `^www\.example\.com$`},
+	} {
+		snapshot := testSnapshot(rule)
+		snapshot.SubscriptionSets = []SubscriptionSet{routeBinding(10, 20, "custom", 0, "example.com")}
+		compiled, err := Compile(snapshot, DefaultLimits())
+		if err != nil {
+			t.Fatal(err)
+		}
+		result, err := compiled.Match("www.example.com")
+		if err != nil || result.Route.RuleID != rule.ID || result.Route.SourceID != 0 {
+			t.Fatalf("%s manual route did not override binding: %+v, err=%v", rule.MatchType, result.Route, err)
+		}
+	}
+}
+
+func TestV3BindingPrecedenceAndCompression(t *testing.T) {
+	snapshot := testSnapshot()
+	snapshot.SubscriptionSets = []SubscriptionSet{
+		routeBinding(1, 30, "parent", 10, "example.com", "duplicate.example"),
+		routeBinding(2, 20, "deep", 100, "api.example.com"),
+		routeBinding(3, 10, "priority", 5, "priority.example", "duplicate.example"),
+		routeBinding(4, 5, "binding", 5, "priority.example"),
+	}
+	compiled, err := Compile(snapshot, DefaultLimits())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(compiled.routeBindings) != 4 {
+		t.Fatalf("flat binding table size = %d, want 4", len(compiled.routeBindings))
+	}
+	for qname, want := range map[string]int64{
+		"www.api.example.com": 20,
+		"priority.example":    5,
+		"duplicate.example":   10,
+	} {
+		result, err := compiled.Match(qname)
+		if err != nil || result.Route.BindingID != want || result.Route.Action != ActionUpstream {
+			t.Fatalf("Match(%q) route = %+v, err=%v, want binding %d", qname, result.Route, err, want)
+		}
+	}
+}
+
+func TestV3SubscriptionChecksumIsOrderIndependent(t *testing.T) {
+	first := testSnapshot()
+	first.SubscriptionSets = []SubscriptionSet{
+		routeBinding(2, 20, "second", 20, "b.example", "a.example"),
+		routeBinding(1, 10, "first", 10, "c.example"),
+	}
+	second := testSnapshot()
+	second.SubscriptionSets = []SubscriptionSet{
+		routeBinding(1, 10, "first", 10, "c.example"),
+		routeBinding(2, 20, "second", 20, "a.example", "b.example"),
+	}
+	a, err := Compile(first, DefaultLimits())
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := Compile(second, DefaultLimits())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a.Checksum() != b.Checksum() {
+		t.Fatalf("subscription checksums differ: %s != %s", a.Checksum(), b.Checksum())
+	}
+}
+
+func TestV3ChecksumMatchesControllerContract(t *testing.T) {
+	tests := []struct {
+		name     string
+		json     string
+		checksum string
+	}{
+		{
+			name:     "empty subscription sets",
+			json:     `{"schema_version":3,"version":7,"expected_current_version":6,"generated_at":"2026-08-04T01:02:03Z","block_rcode":3,"rules":[],"subscription_sets":[]}`,
+			checksum: "sha256:b769858ae147f674e01c524e19c9cb1f0de93130a4e91f6690fdfac2ba28892a",
+		},
+		{
+			name:     "route binding",
+			json:     `{"schema_version":3,"version":8,"expected_current_version":7,"generated_at":"2026-08-04T01:02:03Z","block_rcode":3,"rules":[],"subscription_sets":[{"source_id":42,"source_name":"route-source","category":"route","action":"upstream","binding_id":9,"upstream_group_id":"custom_group","priority":10,"domains":["api.example.com","example.com"]}]}`,
+			checksum: "sha256:5e9647b202b686096c078169ab7a677caf62e04d92e36bc06184517783715e3e",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			snapshot, err := ParseSnapshot([]byte(test.json))
+			if err != nil {
+				t.Fatal(err)
+			}
+			snapshot.Checksum = test.checksum
+			compiled, err := Compile(snapshot, DefaultLimits())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if compiled.Checksum() != test.checksum {
+				t.Fatalf("checksum = %q, want %q", compiled.Checksum(), test.checksum)
+			}
+		})
+	}
+}
+
+func TestV3SubscriptionRuleCapacityBoundary(t *testing.T) {
+	domains := make([]string, DefaultLimits().MaxRules)
+	for i := range domains {
+		domains[i] = fmt.Sprintf("d%d.example", i)
+	}
+	snapshot := testSnapshot()
+	snapshot.SubscriptionSets = []SubscriptionSet{routeBinding(1, 1, "capacity", 1, domains...)}
+	compiled, err := Compile(snapshot, DefaultLimits())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if compiled.RuleCount() != DefaultLimits().MaxRules {
+		t.Fatalf("rule count = %d", compiled.RuleCount())
+	}
+	snapshot.SubscriptionSets[0].Domains = append(snapshot.SubscriptionSets[0].Domains, "overflow.example")
+	if _, err := Compile(snapshot, DefaultLimits()); err == nil {
+		t.Fatal("snapshot above 200k rule capacity was accepted")
 	}
 }
 
@@ -180,6 +393,7 @@ func TestCompileRejectsLimitsAndChecksumMismatch(t *testing.T) {
 
 func TestCompileAcceptsChecksummedEmptyRulesArray(t *testing.T) {
 	snapshot := testSnapshot()
+	snapshot.SchemaVersion = 2
 	snapshot.Rules = []Rule{}
 	encoded, err := json.Marshal(snapshot)
 	if err != nil {

@@ -91,6 +91,7 @@ type QueryEvent struct {
 	RouteRuleID            int64    `json:"route_rule_id"`
 	SubscriptionSourceID   int64    `json:"subscription_source_id"`
 	SubscriptionSourceName string   `json:"subscription_source_name"`
+	SubscriptionBindingID  int64    `json:"subscription_binding_id"`
 	AnswerCount            int      `json:"answer_count"`
 	AnswerMinTTLSeconds    *uint32  `json:"answer_min_ttl_seconds"`
 	SubscriptionCategories []string `json:"subscription_categories,omitempty"`
@@ -251,9 +252,19 @@ func validateArgs(args *Args) error {
 		return fmt.Errorf("request_timeout must be a positive duration")
 	}
 	seen := map[uint32]string{}
-	for name, value := range map[string]uint32{"access_block": args.Marks.AccessBlock, "route_local": args.Marks.RouteLocal, "route_remote": args.Marks.RouteRemote, "no_log": args.Marks.NoLog, "subscription_local": args.Marks.SubscriptionLocal, "subscription_remote": args.Marks.SubscriptionRemote, "subscription_block": args.Marks.SubscriptionBlock, "subscription_allow": args.Marks.SubscriptionAllow, "cache_hit": args.Marks.CacheHit} {
+	requiredMarks := map[string]uint32{"access_block": args.Marks.AccessBlock, "route_local": args.Marks.RouteLocal, "route_remote": args.Marks.RouteRemote, "no_log": args.Marks.NoLog, "cache_hit": args.Marks.CacheHit}
+	for name, value := range requiredMarks {
 		if value == 0 {
 			return fmt.Errorf("marks.%s must be greater than zero", name)
+		}
+		if previous, ok := seen[value]; ok {
+			return fmt.Errorf("marks.%s duplicates marks.%s", name, previous)
+		}
+		seen[value] = name
+	}
+	for name, value := range map[string]uint32{"subscription_local": args.Marks.SubscriptionLocal, "subscription_remote": args.Marks.SubscriptionRemote, "subscription_block": args.Marks.SubscriptionBlock, "subscription_allow": args.Marks.SubscriptionAllow} {
+		if value == 0 {
+			continue
 		}
 		if previous, ok := seen[value]; ok {
 			return fmt.Errorf("marks.%s duplicates marks.%s", name, previous)
@@ -311,13 +322,21 @@ func (p *Plugin) buildEvent(qCtx *query_context.Context, started time.Time, exec
 		mark uint32
 		name string
 	}{{p.marks.SubscriptionAllow, "allow"}, {p.marks.SubscriptionBlock, "block"}, {p.marks.SubscriptionLocal, "local"}, {p.marks.SubscriptionRemote, "remote"}} {
-		if qCtx.HasMark(category.mark) {
-			event.SubscriptionCategories = append(event.SubscriptionCategories, category.name)
+		if category.mark != 0 && qCtx.HasMark(category.mark) {
+			event.SubscriptionCategories = appendUnique(event.SubscriptionCategories, category.name)
 		}
 	}
 	if decision, ok := dynamic_rule_engine.RuntimeDecisionFromContext(qCtx); ok {
 		event.SnapshotVersion, event.AccessRuleID, event.RouteRuleID = decision.SnapshotVersion, decision.AccessRuleID, decision.RouteRuleID
-		event.SubscriptionSourceID, event.SubscriptionSourceName = decision.SubscriptionSourceID, decision.SubscriptionSourceName
+		if decision.AccessSubscriptionSourceID != 0 {
+			event.SubscriptionSourceID, event.SubscriptionSourceName = decision.AccessSubscriptionSourceID, decision.AccessSubscriptionSourceName
+			event.SubscriptionCategories = appendUnique(event.SubscriptionCategories, dynamic_rule_engine.CategoryAccess)
+		}
+		if decision.RouteSubscriptionSourceID != 0 {
+			event.SubscriptionSourceID, event.SubscriptionSourceName = decision.RouteSubscriptionSourceID, decision.RouteSubscriptionSourceName
+			event.SubscriptionBindingID = decision.RouteSubscriptionBindingID
+			event.SubscriptionCategories = appendUnique(event.SubscriptionCategories, dynamic_rule_engine.CategoryRoute)
+		}
 		if event.RouteSource == "" {
 			event.RouteSource = decision.RouteSource
 		}
@@ -395,7 +414,10 @@ func answerRecords(response *dns.Msg) []string {
 
 func (p *Plugin) route(qCtx *query_context.Context) (route, source, upstream string) {
 	if qCtx.HasMark(p.marks.AccessBlock) {
-		if qCtx.HasMark(p.marks.SubscriptionBlock) {
+		if decision, ok := dynamic_rule_engine.RuntimeDecisionFromContext(qCtx); ok && decision.AccessSubscriptionSourceID != 0 && decision.AccessSubscriptionAction == dynamic_rule_engine.ActionBlock {
+			return "block", "subscription", ""
+		}
+		if p.marks.SubscriptionBlock != 0 && qCtx.HasMark(p.marks.SubscriptionBlock) {
 			return "block", "subscription", ""
 		}
 		return "block", "dynamic_rule", ""
@@ -405,7 +427,7 @@ func (p *Plugin) route(qCtx *query_context.Context) (route, source, upstream str
 		dynamicSource = decision.RouteSource == "dynamic_rule"
 	}
 	if qCtx.HasMark(p.marks.RouteLocal) {
-		if qCtx.HasMark(p.marks.SubscriptionLocal) {
+		if p.marks.SubscriptionLocal != 0 && qCtx.HasMark(p.marks.SubscriptionLocal) {
 			return "local", "subscription", "local_dns"
 		}
 		if dynamicSource {
@@ -414,7 +436,7 @@ func (p *Plugin) route(qCtx *query_context.Context) (route, source, upstream str
 		return "local", "default", "local_dns"
 	}
 	if qCtx.HasMark(p.marks.RouteRemote) {
-		if qCtx.HasMark(p.marks.SubscriptionRemote) {
+		if p.marks.SubscriptionRemote != 0 && qCtx.HasMark(p.marks.SubscriptionRemote) {
 			return "remote", "subscription", "remote_dns"
 		}
 		if dynamicSource {
@@ -423,6 +445,15 @@ func (p *Plugin) route(qCtx *query_context.Context) (route, source, upstream str
 		return "remote", "default", "remote_dns"
 	}
 	return "remote", "default", "remote_dns"
+}
+
+func appendUnique(values []string, value string) []string {
+	for _, existing := range values {
+		if existing == value {
+			return values
+		}
+	}
+	return append(values, value)
 }
 
 func (p *Plugin) enqueueNonBlocking(event *QueryEvent) {

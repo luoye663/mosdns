@@ -40,6 +40,7 @@ type CompiledSnapshot struct {
 	domain        [categoryCount]map[string]MatchedRule
 	regex         []compiledRegex
 	subscriptions [categoryCount][]compiledSubscriptionSet
+	routeBindings map[string]MatchedRule
 }
 
 func (s *CompiledSnapshot) SchemaVersion() uint32 { return s.schemaVersion }
@@ -53,7 +54,7 @@ func (s *CompiledSnapshot) LoadedAt() time.Time   { return s.loadedAt }
 // Compile 在 DNS 请求路径外执行全部校验和索引构建。
 func Compile(snapshot Snapshot, limits Limits) (*CompiledSnapshot, error) {
 	limits = normalizeLimits(limits)
-	if snapshot.SchemaVersion != 1 && snapshot.SchemaVersion != SchemaVersion {
+	if snapshot.SchemaVersion < 1 || snapshot.SchemaVersion > SchemaVersion {
 		return nil, fmt.Errorf("schema_version %d is unsupported", snapshot.SchemaVersion)
 	}
 	if snapshot.Version == 0 {
@@ -89,12 +90,14 @@ func Compile(snapshot Snapshot, limits Limits) (*CompiledSnapshot, error) {
 	if err := validateRouteConflicts(normalizedRules); err != nil {
 		return nil, err
 	}
-	normalizedSets, err := normalizeSubscriptionSets(snapshot.SubscriptionSets, limits)
+	normalizedSets, err := normalizeSubscriptionSets(snapshot.SubscriptionSets, snapshot.SchemaVersion, limits)
 	if err != nil {
 		return nil, err
 	}
-	if err := validateSubscriptionRouteConflicts(normalizedRules, normalizedSets); err != nil {
-		return nil, err
+	if snapshot.SchemaVersion < SchemaVersion {
+		if err := validateSubscriptionRouteConflicts(normalizedRules, normalizedSets); err != nil {
+			return nil, err
+		}
 	}
 
 	checksum, canonicalRules, err := checksumSnapshot(snapshot, normalizedRules, normalizedSets)
@@ -113,6 +116,7 @@ func Compile(snapshot Snapshot, limits Limits) (*CompiledSnapshot, error) {
 		ruleCount:     len(canonicalRules),
 		regexpCount:   regexpCount,
 		loadedAt:      time.Now().UTC(),
+		routeBindings: make(map[string]MatchedRule),
 	}
 	for i := range compiled.full {
 		compiled.full[i] = make(map[string]MatchedRule)
@@ -130,16 +134,30 @@ func Compile(snapshot Snapshot, limits Limits) (*CompiledSnapshot, error) {
 	return compiled, nil
 }
 
-func normalizeSubscriptionSets(sets []SubscriptionSet, limits Limits) ([]SubscriptionSet, error) {
+func normalizeSubscriptionSets(sets []SubscriptionSet, schemaVersion uint32, limits Limits) ([]SubscriptionSet, error) {
 	result := make([]SubscriptionSet, len(sets))
-	seen := make(map[int64]struct{}, len(sets))
+	seenSources := make(map[int64]struct{}, len(sets))
+	seenBindings := make(map[int64]struct{}, len(sets))
 	for i, set := range sets {
-		if _, exists := seen[set.SourceID]; exists {
+		if _, exists := seenSources[set.SourceID]; exists {
 			return nil, fmt.Errorf("duplicate subscription set %d", set.SourceID)
 		}
-		seen[set.SourceID] = struct{}{}
+		seenSources[set.SourceID] = struct{}{}
+		if set.BindingID != 0 {
+			if _, exists := seenBindings[set.BindingID]; exists {
+				return nil, fmt.Errorf("duplicate subscription binding %d", set.BindingID)
+			}
+			seenBindings[set.BindingID] = struct{}{}
+		}
 		category, ok := categoryIndex(set.Category)
-		if !ok || category < 0 || !validAction(set.Category, set.Action) || set.SourceID <= 0 || set.SourceName == "" || set.Priority < 0 || set.Priority > 1000 || len(set.Domains) == 0 {
+		validSubscriptionAction := validAction(set.Category, set.Action)
+		if schemaVersion == SchemaVersion && set.Category == CategoryRoute {
+			validSubscriptionAction = set.Action == ActionUpstream && set.BindingID > 0 && validUpstreamGroupID(set.UpstreamGroupID)
+		}
+		if (schemaVersion != SchemaVersion || set.Category != CategoryRoute) && (set.BindingID != 0 || set.UpstreamGroupID != "") {
+			validSubscriptionAction = false
+		}
+		if !ok || category < 0 || !validSubscriptionAction || set.SourceID <= 0 || set.SourceName == "" || set.Priority < 0 || set.Priority > 1000 || len(set.Domains) == 0 {
 			return nil, fmt.Errorf("invalid subscription set %d", set.SourceID)
 		}
 		domains := make([]string, len(set.Domains))
@@ -166,7 +184,15 @@ func normalizeSubscriptionSets(sets []SubscriptionSet, limits Limits) ([]Subscri
 func (s *CompiledSnapshot) addSubscriptionSets(sets []SubscriptionSet, limits Limits) error {
 	for _, set := range sets {
 		category, _ := categoryIndex(set.Category)
-		s.subscriptions[category] = append(s.subscriptions[category], compiledSubscriptionSet{match: MatchedRule{RuleID: set.SourceID, Action: set.Action, MatchType: MatchTypeDomain, Priority: set.Priority, SourceID: set.SourceID, SourceName: set.SourceName}, domains: set.Domains})
+		match := MatchedRule{RuleID: set.SourceID, Action: set.Action, MatchType: MatchTypeDomain, Priority: set.Priority, SourceID: set.SourceID, SourceName: set.SourceName, BindingID: set.BindingID, UpstreamGroupID: set.UpstreamGroupID}
+		if s.schemaVersion == SchemaVersion && category == categoryRoute {
+			for _, domain := range set.Domains {
+				match.Pattern = domain
+				s.routeBindings[domain] = preferredBinding(match, s.routeBindings[domain])
+			}
+			continue
+		}
+		s.subscriptions[category] = append(s.subscriptions[category], compiledSubscriptionSet{match: match, domains: set.Domains})
 	}
 	return nil
 }
@@ -251,6 +277,20 @@ func (s *CompiledSnapshot) matchCategory(qname string, category int) MatchedRule
 		}
 		suffix = suffix[separator+1:]
 	}
+	if s.schemaVersion == SchemaVersion && category == categoryRoute {
+		if best.Matched() {
+			return best
+		}
+		for _, rule := range s.regex {
+			if rule.category == category && rule.re.MatchString(qname) {
+				best = preferred(rule.match, best, category)
+			}
+		}
+		if best.Matched() {
+			return best
+		}
+		return s.matchRouteBinding(qname)
+	}
 	for _, set := range s.subscriptions[category] {
 		if subscriptionMatches(set.domains, qname) {
 			best = preferred(set.match, best, category)
@@ -265,6 +305,20 @@ func (s *CompiledSnapshot) matchCategory(qname string, category int) MatchedRule
 		}
 	}
 	return best
+}
+
+func (s *CompiledSnapshot) matchRouteBinding(qname string) MatchedRule {
+	for suffix := qname; suffix != ""; {
+		if match, ok := s.routeBindings[suffix]; ok {
+			return match
+		}
+		separator := strings.IndexByte(suffix, '.')
+		if separator < 0 {
+			break
+		}
+		suffix = suffix[separator+1:]
+	}
+	return MatchedRule{}
 }
 
 func subscriptionMatches(domains []string, qname string) bool {
@@ -375,6 +429,19 @@ func validAction(category, action string) bool {
 	}
 }
 
+var upstreamGroupIDRegexp = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,63}$`)
+
+func validUpstreamGroupID(groupID string) bool {
+	return upstreamGroupIDRegexp.MatchString(groupID)
+}
+
+func preferredBinding(candidate, current MatchedRule) MatchedRule {
+	if !current.Matched() || candidate.Priority < current.Priority || candidate.Priority == current.Priority && candidate.BindingID < current.BindingID {
+		return candidate
+	}
+	return current
+}
+
 // preferred 按 priority 和规格定义的同级语义选择唯一且确定的记录。
 func preferred(candidate, current MatchedRule, category int) MatchedRule {
 	if !current.Matched() || candidate.Priority > current.Priority {
@@ -430,13 +497,62 @@ func checksumSnapshot(snapshot Snapshot, rules []Rule, sets []SubscriptionSet) (
 		}
 		return a.ID < b.ID
 	})
-	canonical := Snapshot{SchemaVersion: snapshot.SchemaVersion, Version: snapshot.Version, ExpectedCurrentVersion: snapshot.ExpectedCurrentVersion, GeneratedAt: snapshot.GeneratedAt.UTC(), BlockRCode: snapshot.BlockRCode, Rules: rules, SubscriptionSets: sets}
+	var canonical any
+	if snapshot.SchemaVersion == SchemaVersion {
+		canonicalSets := make([]canonicalSubscriptionSetV3, len(sets))
+		for i, set := range sets {
+			canonicalSets[i] = canonicalSubscriptionSetV3{
+				SourceID: set.SourceID, SourceName: set.SourceName, Category: set.Category, Action: set.Action,
+				BindingID: set.BindingID, UpstreamGroupID: set.UpstreamGroupID, Priority: set.Priority, Domains: set.Domains,
+			}
+		}
+		canonical = canonicalSnapshotV3{
+			SchemaVersion: snapshot.SchemaVersion, Version: snapshot.Version, ExpectedCurrentVersion: snapshot.ExpectedCurrentVersion,
+			GeneratedAt: snapshot.GeneratedAt.UTC(), BlockRCode: snapshot.BlockRCode, Rules: rules, SubscriptionSets: canonicalSets,
+		}
+	} else {
+		canonical = canonicalSnapshotLegacy{
+			SchemaVersion: snapshot.SchemaVersion, Version: snapshot.Version, ExpectedCurrentVersion: snapshot.ExpectedCurrentVersion,
+			GeneratedAt: snapshot.GeneratedAt.UTC(), BlockRCode: snapshot.BlockRCode, Rules: rules, SubscriptionSets: sets,
+		}
+	}
 	b, err := json.Marshal(canonical)
 	if err != nil {
 		return "", nil, fmt.Errorf("marshal canonical snapshot: %w", err)
 	}
 	sum := sha256.Sum256(b)
 	return "sha256:" + hex.EncodeToString(sum[:]), rules, nil
+}
+
+type canonicalSnapshotLegacy struct {
+	SchemaVersion          uint32            `json:"schema_version"`
+	Version                uint64            `json:"version"`
+	ExpectedCurrentVersion uint64            `json:"expected_current_version"`
+	GeneratedAt            time.Time         `json:"generated_at"`
+	BlockRCode             int               `json:"block_rcode"`
+	Rules                  []Rule            `json:"rules"`
+	SubscriptionSets       []SubscriptionSet `json:"subscription_sets,omitempty"`
+}
+
+type canonicalSnapshotV3 struct {
+	SchemaVersion          uint32                       `json:"schema_version"`
+	Version                uint64                       `json:"version"`
+	ExpectedCurrentVersion uint64                       `json:"expected_current_version"`
+	GeneratedAt            time.Time                    `json:"generated_at"`
+	BlockRCode             int                          `json:"block_rcode"`
+	Rules                  []Rule                       `json:"rules"`
+	SubscriptionSets       []canonicalSubscriptionSetV3 `json:"subscription_sets"`
+}
+
+type canonicalSubscriptionSetV3 struct {
+	SourceID        int64    `json:"source_id"`
+	SourceName      string   `json:"source_name"`
+	Category        string   `json:"category"`
+	Action          string   `json:"action"`
+	BindingID       int64    `json:"binding_id,omitempty"`
+	UpstreamGroupID string   `json:"upstream_group_id,omitempty"`
+	Priority        int      `json:"priority"`
+	Domains         []string `json:"domains"`
 }
 
 // ParseSnapshot 使用严格 decoder，避免 API 层接受拼写错误或未定义字段。
