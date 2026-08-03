@@ -29,6 +29,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strconv"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -152,6 +154,125 @@ func TestCacheKeySeparatesECSSubnets(t *testing.T) {
 	second.IsEdns0().Option[0] = &dns.EDNS0_SUBNET{Code: dns.EDNS0SUBNET, Family: 1, SourceNetmask: 24, Address: []byte{198, 51, 100, 0}}
 	if getMsgKey(first) == getMsgKey(second) {
 		t.Fatal("distinct ECS subnets share a cache key")
+	}
+}
+
+func TestCacheKeySeparatesQuestionClasses(t *testing.T) {
+	inet := new(dns.Msg)
+	inet.SetQuestion("example.com.", dns.TypeA)
+	chaos := inet.Copy()
+	chaos.Question[0].Qclass = dns.ClassCHAOS
+	if getMsgKey(inet) == getMsgKey(chaos) {
+		t.Fatal("distinct question classes share a cache key")
+	}
+}
+
+func TestRuntimeLazyRefreshDeduplicatesWithoutBlockingHits(t *testing.T) {
+	runtime := newTestRuntime(t, 60)
+	query := runtimeQuery("lazy.example.")
+	msgKey := getMsgKey(query)
+	now := time.Now()
+	runtime.backend.Store(key(msgKey), &item{resp: runtimeResponse(query), storedTime: now.Add(-time.Minute), expirationTime: now.Add(-time.Second)}, now.Add(time.Minute))
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var calls atomic.Int32
+	var once sync.Once
+	forward := func(_ context.Context, qCtx *query_context.Context) error {
+		calls.Add(1)
+		once.Do(func() { close(started) })
+		<-release
+		qCtx.SetResponse(runtimeResponse(qCtx.Q()))
+		return nil
+	}
+
+	const callers = 64
+	start := make(chan struct{})
+	var callersWG sync.WaitGroup
+	callersWG.Add(callers)
+	for range callers {
+		go func() {
+			defer callersWG.Done()
+			<-start
+			qCtx := query_context.NewContext(query.Copy())
+			if hit, _, err := runtime.Exec(context.Background(), qCtx, forward); err != nil || !hit {
+				t.Errorf("lazy lookup hit=%t err=%v", hit, err)
+			}
+		}()
+	}
+	close(start)
+	callersDone := make(chan struct{})
+	go func() { callersWG.Wait(); close(callersDone) }()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("lazy refresh did not start")
+	}
+	select {
+	case <-callersDone:
+	case <-time.After(time.Second):
+		t.Fatal("lazy cache hits waited for refresh")
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("lazy refresh calls = %d, want 1", got)
+	}
+	close(release)
+	if err := runtime.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRuntimeFlushBlocksInFlightMissWriteback(t *testing.T) {
+	runtime := newTestRuntime(t, 0)
+	query := runtimeQuery("miss-flush.example.")
+	started, release := make(chan struct{}), make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		qCtx := query_context.NewContext(query)
+		_, _, err := runtime.Exec(context.Background(), qCtx, func(_ context.Context, qCtx *query_context.Context) error {
+			close(started)
+			<-release
+			qCtx.SetResponse(runtimeResponse(qCtx.Q()))
+			return nil
+		})
+		done <- err
+	}()
+	<-started
+	runtime.Flush()
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if got := runtime.Len(); got != 0 {
+		t.Fatalf("in-flight miss restored %d entries after flush", got)
+	}
+}
+
+func TestRuntimeFlushBlocksInFlightLazyWriteback(t *testing.T) {
+	runtime := newTestRuntime(t, 60)
+	query := runtimeQuery("lazy-flush.example.")
+	msgKey := getMsgKey(query)
+	now := time.Now()
+	runtime.backend.Store(key(msgKey), &item{resp: runtimeResponse(query), storedTime: now.Add(-time.Minute), expirationTime: now.Add(-time.Second)}, now.Add(time.Minute))
+	started, release := make(chan struct{}), make(chan struct{})
+	qCtx := query_context.NewContext(query.Copy())
+	hit, _, err := runtime.Exec(context.Background(), qCtx, func(_ context.Context, qCtx *query_context.Context) error {
+		close(started)
+		<-release
+		qCtx.SetResponse(runtimeResponse(qCtx.Q()))
+		return nil
+	})
+	if err != nil || !hit {
+		t.Fatalf("lazy lookup hit=%t err=%v", hit, err)
+	}
+	<-started
+	runtime.Flush()
+	close(release)
+	if err := runtime.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if got := runtime.Len(); got != 0 {
+		t.Fatalf("lazy refresh restored %d entries after flush", got)
 	}
 }
 
@@ -365,5 +486,28 @@ func cacheAPIRequest(c *Cache, method, path, body string) *httptest.ResponseReco
 	request.Header.Set("Authorization", "Bearer cache-test-token")
 	response := httptest.NewRecorder()
 	c.Api().ServeHTTP(response, request)
+	return response
+}
+
+func newTestRuntime(t *testing.T, lazyTTL int) *Runtime {
+	t.Helper()
+	runtime, err := NewRuntime(RuntimeConfig{Enabled: true, Size: 128, LazyCacheTTL: lazyTTL, NegativeTTLSeconds: 30})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = runtime.Close() })
+	return runtime
+}
+
+func runtimeQuery(name string) *dns.Msg {
+	query := new(dns.Msg)
+	query.SetQuestion(name, dns.TypeA)
+	return query
+}
+
+func runtimeResponse(query *dns.Msg) *dns.Msg {
+	response := new(dns.Msg)
+	response.SetReply(query)
+	response.Answer = []dns.RR{&dns.A{Hdr: dns.RR_Header{Name: query.Question[0].Name, Rrtype: dns.TypeA, Class: query.Question[0].Qclass, Ttl: 60}, A: []byte{192, 0, 2, 1}}}
 	return response
 }

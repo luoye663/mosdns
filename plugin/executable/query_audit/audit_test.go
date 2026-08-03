@@ -244,6 +244,17 @@ func TestBuildEventReportsSelectedUpstreamTag(t *testing.T) {
 	}
 }
 
+func TestBuildEventPrefersRegistryMetadata(t *testing.T) {
+	p := newTestAuditPlugin(t, "http://127.0.0.1:1", 1, 1)
+	defer p.Close()
+	qCtx := testContext("registry.example")
+	query_context.SetUpstreamRuntimeMeta(qCtx, query_context.UpstreamRuntimeMeta{GroupID: "custom", GroupName: "Custom", RouteSource: "subscription", UpstreamTag: "selected", CacheHit: true})
+	event := p.buildEvent(qCtx, time.Now(), nil)
+	if event.Route != "forward" || event.RouteSource != "subscription" || event.UpstreamGroup != "custom" || event.UpstreamTag != "selected" || !event.CacheHit {
+		t.Fatalf("registry audit event = %+v", event)
+	}
+}
+
 func TestQueueFullDoesNotBlockDNSPath(t *testing.T) {
 	p := newTestAuditPlugin(t, "http://127.0.0.1:1", 1, 1)
 	defer p.Close()

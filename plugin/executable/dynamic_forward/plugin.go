@@ -2,6 +2,7 @@
 package dynamic_forward
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"crypto/subtle"
@@ -57,6 +58,107 @@ type Upstream struct {
 	Priority int    `json:"priority" yaml:"priority"`
 	Weight   int    `json:"weight" yaml:"weight"`
 }
+
+// LoadSnapshotFiles reads and normalizes a persisted dynamic_forward snapshot.
+// Current is preferred, backup is used if current is unreadable or invalid.
+// The bool is false only when neither file exists.
+func LoadSnapshotFiles(currentFile, backupFile string) (Snapshot, bool, error) {
+	var failures []error
+	found := false
+	for _, filename := range []string{currentFile, backupFile} {
+		data, err := os.ReadFile(filename)
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		found = true
+		if err != nil {
+			failures = append(failures, fmt.Errorf("read %s: %w", filename, err))
+			continue
+		}
+		var snapshot Snapshot
+		decoder := json.NewDecoder(bytes.NewReader(data))
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&snapshot); err != nil {
+			failures = append(failures, fmt.Errorf("parse %s: %w", filename, err))
+			continue
+		}
+		if decoder.Decode(&struct{}{}) != io.EOF {
+			failures = append(failures, fmt.Errorf("parse %s: trailing JSON", filename))
+			continue
+		}
+		snapshot, err = canonical(snapshot)
+		if err != nil {
+			failures = append(failures, fmt.Errorf("validate %s: %w", filename, err))
+			continue
+		}
+		return snapshot, true, nil
+	}
+	if !found {
+		return Snapshot{}, false, nil
+	}
+	return Snapshot{}, true, errors.Join(failures...)
+}
+
+// Runtime is the reusable forwarding runtime used by dynamic plugins.
+// It preserves dynamic_forward's race, weighted and failover semantics.
+type Runtime struct {
+	forward *fastforward.Forward
+	mode    string
+	count   int
+	items   []Upstream
+	levels  [][]string
+}
+
+type RuntimeConfig struct {
+	Mode       string
+	Concurrent int
+	Socks5     string
+	Upstreams  []Upstream
+}
+
+func CanonicalRuntimeConfig(config RuntimeConfig) (RuntimeConfig, error) {
+	snapshot, err := canonical(Snapshot{Version: 1, Mode: config.Mode, Concurrent: config.Concurrent, Socks5: config.Socks5, Upstreams: config.Upstreams})
+	if err != nil {
+		return RuntimeConfig{}, err
+	}
+	return RuntimeConfig{Mode: snapshot.Mode, Concurrent: snapshot.Concurrent, Socks5: snapshot.Socks5, Upstreams: snapshot.Upstreams}, nil
+}
+
+func NewRuntime(mode string, concurrent int, socks5 string, upstreams []Upstream, logger *zap.Logger, metricsTag string) (*Runtime, error) {
+	config, err := CanonicalRuntimeConfig(RuntimeConfig{Mode: mode, Concurrent: concurrent, Socks5: socks5, Upstreams: upstreams})
+	if err != nil {
+		return nil, err
+	}
+	forward, err := fastforward.NewForward(&fastforward.Args{Concurrent: config.Concurrent, Socks5: config.Socks5, Upstreams: forwardUpstreams(config.Upstreams)}, fastforward.Opts{Logger: logger, MetricsTag: metricsTag})
+	if err != nil {
+		return nil, errors.New("invalid upstream configuration")
+	}
+	return &Runtime{forward: forward, mode: config.Mode, count: config.Concurrent, items: config.Upstreams, levels: priorityLevels(config.Upstreams)}, nil
+}
+
+func (r *Runtime) Exec(ctx context.Context, qCtx *query_context.Context) error {
+	switch r.mode {
+	case "weighted":
+		return r.forward.ExecWithTags(ctx, qCtx, weightedTags(r.items, r.count))
+	case "failover":
+		var lastErr error
+		for _, level := range r.levels {
+			err := r.forward.ExecWithTags(ctx, qCtx, level)
+			if err != nil {
+				lastErr = err
+				continue
+			}
+			if response := qCtx.R(); response == nil || response.Rcode != dns.RcodeServerFailure {
+				return nil
+			}
+		}
+		return lastErr
+	default:
+		return r.forward.Exec(ctx, qCtx)
+	}
+}
+
+func (r *Runtime) Close() error { return r.forward.Close() }
 
 type runtimeForward struct {
 	forward  *fastforward.Forward

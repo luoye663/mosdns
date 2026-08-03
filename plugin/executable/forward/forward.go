@@ -26,6 +26,7 @@ import (
 	"fmt"
 	"math/rand/v2"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/IrineSistiana/mosdns/v5/coremain"
@@ -278,6 +279,9 @@ func (f *Forward) exchange(ctx context.Context, qCtx *query_context.Context, us 
 	if concurrent > maxConcurrentQueries {
 		concurrent = maxConcurrentQueries
 	}
+	if concurrent > len(us) {
+		concurrent = len(us)
+	}
 
 	type res struct {
 		r           *dns.Msg
@@ -285,18 +289,24 @@ func (f *Forward) exchange(ctx context.Context, qCtx *query_context.Context, us 
 		upstreamTag string
 	}
 
-	resChan := make(chan res)
-	done := make(chan struct{})
-	defer close(done)
+	resChan := make(chan res, concurrent)
+	racingCtx, cancelRace := context.WithCancel(ctx)
+	var workers sync.WaitGroup
+	defer func() {
+		cancelRace()
+		workers.Wait()
+	}()
 
 	r := rand.IntN(len(us))
 	for i := 0; i < concurrent; i++ {
 		u := us[(r+i)%len(us)]
 		qc := copyPayload(queryPayload)
+		workers.Add(1)
 		go func(uqid uint32, question dns.Question) {
+			defer workers.Done()
 			defer pool.ReleaseBuf(qc)
 			// Give each upstream a fixed timeout to finish the query.
-			upstreamCtx, cancel := context.WithTimeout(context.Background(), queryTimeout)
+			upstreamCtx, cancel := context.WithTimeout(racingCtx, queryTimeout)
 			defer cancel()
 
 			var r *dns.Msg
@@ -319,10 +329,7 @@ func (f *Forward) exchange(ctx context.Context, qCtx *query_context.Context, us 
 					r = nil
 				}
 			}
-			select {
-			case resChan <- res{r: r, err: err, upstreamTag: u.cfg.Tag}:
-			case <-done:
-			}
+			resChan <- res{r: r, err: err, upstreamTag: u.cfg.Tag}
 		}(qCtx.Id(), qCtx.QQuestion())
 	}
 

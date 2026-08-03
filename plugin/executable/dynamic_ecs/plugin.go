@@ -2,6 +2,7 @@
 package dynamic_ecs
 
 import (
+	"bytes"
 	"context"
 	"crypto/subtle"
 	"encoding/json"
@@ -43,6 +44,76 @@ type Snapshot struct {
 	// Preset is retained only to migrate snapshots written by the first ECS release.
 	Preset string `json:"preset,omitempty" yaml:"preset"`
 }
+
+// LoadSnapshotFiles reads and normalizes a persisted dynamic_ecs snapshot.
+// Current is preferred, backup is used if current is unreadable or invalid.
+// The bool is false only when neither file exists.
+func LoadSnapshotFiles(currentFile, backupFile string) (Snapshot, bool, error) {
+	var failures []error
+	found := false
+	for _, filename := range []string{currentFile, backupFile} {
+		data, err := os.ReadFile(filename)
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		found = true
+		if err != nil {
+			failures = append(failures, fmt.Errorf("read %s: %w", filename, err))
+			continue
+		}
+		var snapshot Snapshot
+		decoder := json.NewDecoder(bytes.NewReader(data))
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&snapshot); err != nil {
+			failures = append(failures, fmt.Errorf("parse %s: %w", filename, err))
+			continue
+		}
+		if decoder.Decode(&struct{}{}) != io.EOF {
+			failures = append(failures, fmt.Errorf("parse %s: trailing JSON", filename))
+			continue
+		}
+		if snapshot.Version == 0 {
+			failures = append(failures, fmt.Errorf("validate %s: version must be positive", filename))
+			continue
+		}
+		snapshot, err = canonical(snapshot)
+		if err != nil {
+			failures = append(failures, fmt.Errorf("validate %s: %w", filename, err))
+			continue
+		}
+		return snapshot, true, nil
+	}
+	if !found {
+		return Snapshot{}, false, nil
+	}
+	return Snapshot{}, true, errors.Join(failures...)
+}
+
+// Config is the reusable ECS configuration embedded by dynamic runtimes.
+type Config struct {
+	Mode    string `json:"mode" yaml:"mode"`
+	Mask4   int    `json:"mask4" yaml:"mask4"`
+	Mask6   int    `json:"mask6" yaml:"mask6"`
+	Preset4 string `json:"preset4,omitempty" yaml:"preset4"`
+	Preset6 string `json:"preset6,omitempty" yaml:"preset6"`
+}
+
+func CanonicalConfig(config Config) (Config, error) {
+	value, err := canonical(Snapshot{Version: 1, Mode: config.Mode, Mask4: config.Mask4, Mask6: config.Mask6, Preset4: config.Preset4, Preset6: config.Preset6})
+	if err != nil {
+		return Config{}, err
+	}
+	return Config{Mode: value.Mode, Mask4: value.Mask4, Mask6: value.Mask6, Preset4: value.Preset4, Preset6: value.Preset6}, nil
+}
+
+// ApplyConfig adds ECS to qCtx without owning any mutable plugin state.
+func ApplyConfig(qCtx *query_context.Context, config Config) error {
+	value := Snapshot{Version: 1, Mode: config.Mode, Mask4: config.Mask4, Mask6: config.Mask6, Preset4: config.Preset4, Preset6: config.Preset6}
+	p := &Plugin{}
+	p.snapshot.Store(&value)
+	return p.Exec(context.Background(), qCtx)
+}
+
 type Plugin struct {
 	snapshot                 atomic.Pointer[Snapshot]
 	token                    []byte

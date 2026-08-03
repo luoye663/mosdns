@@ -52,7 +52,7 @@ func getMsgKey(q *dns.Msg) string {
 	)
 
 	question := q.Question[0]
-	buf := make([]byte, 1+2+1+len(question.Name)) // bits + qtype + qname length + qname
+	buf := make([]byte, 1+2+2+1+len(question.Name)) // bits + qtype + qclass + qname length + qname
 	b := byte(0)
 	// RFC 6840 5.7: The AD bit in a query as a signal
 	// indicating that the requester understands and is interested in the
@@ -69,8 +69,10 @@ func getMsgKey(q *dns.Msg) string {
 	buf[0] = b
 	buf[1] = byte(question.Qtype << 8)
 	buf[2] = byte(question.Qtype)
-	buf[3] = byte(len(question.Name))
-	copy(buf[4:], question.Name)
+	buf[3] = byte(question.Qclass << 8)
+	buf[4] = byte(question.Qclass)
+	buf[5] = byte(len(question.Name))
+	copy(buf[6:], question.Name)
 	// ECS changes an upstream's geographic answer. Include it in the key so
 	// clients from distinct anonymous subnets can never share an answer.
 	if opt := q.IsEdns0(); opt != nil {
@@ -89,6 +91,7 @@ type item struct {
 	resp           *dns.Msg
 	storedTime     time.Time
 	expirationTime time.Time
+	upstreamTag    string
 }
 
 func copyNoOpt(m *dns.Msg) *dns.Msg {
@@ -145,6 +148,11 @@ func min[T constraints.Ordered](a, b T) T {
 // Returned bool indicates whether this response is hit by lazy cache.
 // Note: Caller SHOULD change the msg id because it's not same as query's.
 func getRespFromCache(msgKey string, backend *cache.Cache[key, *item], lazyCacheEnabled bool, lazyTtl int) (*dns.Msg, bool) {
+	response, lazy, _ := getRespFromCacheWithTag(msgKey, backend, lazyCacheEnabled, lazyTtl)
+	return response, lazy
+}
+
+func getRespFromCacheWithTag(msgKey string, backend *cache.Cache[key, *item], lazyCacheEnabled bool, lazyTtl int) (*dns.Msg, bool, string) {
 	// Lookup cache
 	v, _, _ := backend.Get(key(msgKey))
 
@@ -156,7 +164,7 @@ func getRespFromCache(msgKey string, backend *cache.Cache[key, *item], lazyCache
 		if now.Before(v.expirationTime) {
 			r := v.resp.Copy()
 			dnsutils.SubtractTTL(r, uint32(now.Sub(v.storedTime).Seconds()))
-			return r, false
+			return r, false, v.upstreamTag
 		}
 
 		// Msg expired but cache isn't. This is a lazy cache enabled entry.
@@ -164,17 +172,21 @@ func getRespFromCache(msgKey string, backend *cache.Cache[key, *item], lazyCache
 		if lazyCacheEnabled {
 			r := v.resp.Copy()
 			dnsutils.SetTTL(r, uint32(lazyTtl))
-			return r, true
+			return r, true, v.upstreamTag
 		}
 	}
 
 	// cache miss
-	return nil, false
+	return nil, false, ""
 }
 
 // saveRespToCache saves r to cache backend. It returns false if r
 // should not be cached and was skipped.
 func saveRespToCache(msgKey string, r *dns.Msg, backend *cache.Cache[key, *item], lazyCacheTtl int, negativeConfig negativeCacheConfig) bool {
+	return saveRespToCacheWithTag(msgKey, r, backend, lazyCacheTtl, negativeConfig, "")
+}
+
+func saveRespToCacheWithTag(msgKey string, r *dns.Msg, backend *cache.Cache[key, *item], lazyCacheTtl int, negativeConfig negativeCacheConfig, upstreamTag string) bool {
 	if r.Truncated != false {
 		return false
 	}
@@ -210,6 +222,7 @@ func saveRespToCache(msgKey string, r *dns.Msg, backend *cache.Cache[key, *item]
 		resp:           resp,
 		storedTime:     now,
 		expirationTime: now.Add(msgTtl),
+		upstreamTag:    upstreamTag,
 	}
 	backend.Store(key(msgKey), v, now.Add(cacheTtl))
 	return true

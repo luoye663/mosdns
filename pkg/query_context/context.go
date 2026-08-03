@@ -56,6 +56,42 @@ type Context struct {
 
 var contextUid atomic.Uint32
 
+var (
+	requestedUpstreamGroupKey = RegKey()
+	upstreamRuntimeMetaKey    = RegKey()
+)
+
+// UpstreamRuntimeMeta describes the runtime route selected for this query.
+type UpstreamRuntimeMeta struct {
+	GroupID     string
+	GroupName   string
+	RouteSource string
+	UpstreamTag string
+	CacheHit    bool
+}
+
+// SetUpstreamGroupID reserves an explicit group selection for later runtime
+// binding (for example, by subscription matching). It takes priority over marks.
+func SetUpstreamGroupID(ctx *Context, groupID string) {
+	ctx.StoreValue(requestedUpstreamGroupKey, groupID)
+}
+
+func UpstreamGroupID(ctx *Context) (string, bool) {
+	value, ok := ctx.GetValue(requestedUpstreamGroupKey)
+	groupID, valid := value.(string)
+	return groupID, ok && valid && groupID != ""
+}
+
+func SetUpstreamRuntimeMeta(ctx *Context, meta UpstreamRuntimeMeta) {
+	ctx.StoreValue(upstreamRuntimeMetaKey, meta)
+}
+
+func UpstreamRuntimeMetaFromContext(ctx *Context) (UpstreamRuntimeMeta, bool) {
+	value, ok := ctx.GetValue(upstreamRuntimeMetaKey)
+	meta, valid := value.(UpstreamRuntimeMeta)
+	return meta, ok && valid
+}
+
 type ServerMeta = server.QueryMeta
 
 // NewContext creates a new query Context.

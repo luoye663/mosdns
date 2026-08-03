@@ -289,10 +289,22 @@ func (p *Plugin) buildEvent(qCtx *query_context.Context, started time.Time, exec
 		rcode, answerCount = response.Rcode, len(response.Answer)
 	}
 	route, routeSource, upstream := p.route(qCtx)
+	upstreamTag := fastforward.SelectedUpstreamTag(qCtx)
+	cacheHit := qCtx.HasMark(p.marks.CacheHit)
+	if metadata, ok := query_context.UpstreamRuntimeMetaFromContext(qCtx); ok {
+		routeSource, upstream, upstreamTag, cacheHit = metadata.RouteSource, metadata.GroupID, metadata.UpstreamTag, metadata.CacheHit
+		if metadata.GroupID == "local_dns" {
+			route = "local"
+		} else if metadata.GroupID == "remote_dns" {
+			route = "remote"
+		} else {
+			route = "forward"
+		}
+	}
 	event := &QueryEvent{
 		SchemaVersion: eventSchemaVersion, EventID: p.newEventID(), TimestampUnixMS: time.Now().UnixMilli(), ProcessStartedAtUnixMS: p.processStarted.UnixMilli(),
 		ClientIP: qCtx.ServerMeta.ClientAddr.String(), Protocol: protocol(qCtx), QName: normalizeQName(question.Name), QType: question.Qtype, QClass: question.Qclass,
-		RCode: rcode, Route: route, RouteSource: routeSource, UpstreamGroup: upstream, UpstreamTag: fastforward.SelectedUpstreamTag(qCtx), CacheHit: qCtx.HasMark(p.marks.CacheHit),
+		RCode: rcode, Route: route, RouteSource: routeSource, UpstreamGroup: upstream, UpstreamTag: upstreamTag, CacheHit: cacheHit,
 		AnswerCount: answerCount, LatencyUS: time.Since(started).Microseconds(),
 	}
 	for _, category := range []struct {

@@ -3,6 +3,7 @@ package fastforward
 import (
 	"context"
 	"errors"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -17,6 +18,38 @@ type testUpstream struct {
 	delay time.Duration
 	err   error
 }
+
+type observedUpstream struct {
+	started  chan struct{}
+	canceled atomic.Bool
+	calls    atomic.Int32
+	block    bool
+}
+
+func (u *observedUpstream) ExchangeContext(ctx context.Context, payload []byte) (*[]byte, error) {
+	u.calls.Add(1)
+	if u.started != nil {
+		select {
+		case <-u.started:
+		default:
+			close(u.started)
+		}
+	}
+	if u.block {
+		<-ctx.Done()
+		u.canceled.Store(true)
+		return nil, context.Cause(ctx)
+	}
+	query := new(dns.Msg)
+	if err := query.Unpack(payload); err != nil {
+		return nil, err
+	}
+	response := new(dns.Msg)
+	response.SetReply(query)
+	return pool.PackBuffer(response)
+}
+
+func (u *observedUpstream) Close() error { return nil }
 
 var _ upstream.Upstream = (*testUpstream)(nil)
 
@@ -104,6 +137,42 @@ func TestExecDoesNotSubstituteAddressForMissingTag(t *testing.T) {
 	}
 	if got := SelectedUpstreamTag(qCtx); got != "" {
 		t.Fatalf("selected upstream tag = %q, want empty", got)
+	}
+}
+
+func TestExchangeCancelsAndWaitsForLosingWorkers(t *testing.T) {
+	blocked := &observedUpstream{started: make(chan struct{}), block: true}
+	fast := &testUpstream{delay: 20 * time.Millisecond}
+	f := testForward(
+		struct {
+			tag string
+			u   upstream.Upstream
+		}{tag: "blocked", u: blocked},
+		struct {
+			tag string
+			u   upstream.Upstream
+		}{tag: "fast", u: fast},
+	)
+	if err := f.Exec(context.Background(), testQueryContext()); err != nil {
+		t.Fatal(err)
+	}
+	if !blocked.canceled.Load() {
+		t.Fatal("exchange returned before losing worker observed cancellation")
+	}
+}
+
+func TestExchangeClampsConcurrencyToCandidateCount(t *testing.T) {
+	only := &observedUpstream{}
+	f := testForward(struct {
+		tag string
+		u   upstream.Upstream
+	}{tag: "only", u: only})
+	f.args.Concurrent = maxConcurrentQueries
+	if err := f.Exec(context.Background(), testQueryContext()); err != nil {
+		t.Fatal(err)
+	}
+	if got := only.calls.Load(); got != 1 {
+		t.Fatalf("single candidate queried %d times", got)
 	}
 }
 
