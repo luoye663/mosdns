@@ -3,6 +3,7 @@ package cache
 import (
 	"context"
 	"errors"
+	"io"
 	"sync"
 
 	cachepkg "github.com/IrineSistiana/mosdns/v5/pkg/cache"
@@ -135,6 +136,47 @@ func (r *Runtime) Flush() {
 	r.mu.Unlock()
 }
 func (r *Runtime) Len() int { return r.backend.Len() }
+
+// WriteDump writes this runtime using the cache plugin's versioned dump format.
+func (r *Runtime) WriteDump(w io.Writer) (int, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.closed {
+		return 0, errors.New("cache runtime is closed")
+	}
+	return (&Cache{backend: r.backend}).writeDump(w)
+}
+
+// ReadDump loads this runtime using the cache plugin's versioned dump format.
+func (r *Runtime) ReadDump(reader io.Reader) (int, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.closed {
+		return 0, errors.New("cache runtime is closed")
+	}
+	holder := &Cache{backend: r.backend}
+	holder.lazyCacheTTL.Store(int64(r.config.LazyCacheTTL))
+	holder.negativeCache.Store(&negativeCacheConfig{Enabled: r.config.NegativeEnabled, TTLSeconds: r.config.NegativeTTLSeconds})
+	return holder.readDump(reader)
+}
+
+// CloseWithDump drains in-flight work, writes the final cache state, and closes the backend.
+func (r *Runtime) CloseWithDump(w io.Writer) (int, error) {
+	r.mu.Lock()
+	if r.closed {
+		r.mu.Unlock()
+		return 0, errors.New("cache runtime is closed")
+	}
+	r.closed = true
+	r.generation++
+	r.mu.Unlock()
+	r.wg.Wait()
+	r.mu.Lock()
+	entries, dumpErr := (&Cache{backend: r.backend}).writeDump(w)
+	r.mu.Unlock()
+	return entries, errors.Join(dumpErr, r.backend.Close())
+}
+
 func (r *Runtime) Close() error {
 	r.mu.Lock()
 	if r.closed {

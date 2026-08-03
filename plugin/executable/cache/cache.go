@@ -586,7 +586,8 @@ func (c *Cache) readDump(r io.Reader) (int, error) {
 				}
 				capNegativeSOATTL(resp, negativeTTL)
 			}
-			if !time.Now().Before(msgExpTime) || !time.Now().Before(cacheExpTime) {
+			now := time.Now()
+			if !now.Before(cacheExpTime) || c.lazyCacheTTL.Load() == 0 && !now.Before(msgExpTime) {
 				continue
 			}
 

@@ -11,6 +11,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
@@ -44,6 +45,7 @@ type Args struct {
 	AuthTokenFile   string        `yaml:"auth_token_file"`
 	SnapshotFile    string        `yaml:"snapshot_file"`
 	BackupFile      string        `yaml:"backup_file"`
+	CacheDumpDir    string        `yaml:"cache_dump_dir"`
 	InitialSnapshot Snapshot      `yaml:"initial_snapshot"`
 	LegacyGroups    []LegacyGroup `yaml:"legacy_groups"`
 }
@@ -104,19 +106,25 @@ func (g *runtimeGroup) close() {
 }
 
 type runtimeState struct {
-	snapshot Snapshot
-	groups   map[string]*runtimeGroup
-	refs     atomic.Int64
-	retired  atomic.Bool
-	closed   atomic.Bool
+	snapshot    Snapshot
+	groups      map[string]*runtimeGroup
+	refs        atomic.Int64
+	retired     atomic.Bool
+	closed      atomic.Bool
+	beforeClose func(*runtimeState)
+	done        chan struct{}
 }
 
 func (s *runtimeState) retire() { s.retired.Store(true); s.closeWhenIdle() }
 func (s *runtimeState) closeWhenIdle() {
 	if s.retired.Load() && s.refs.Load() == 0 && s.closed.CompareAndSwap(false, true) {
+		if s.beforeClose != nil {
+			s.beforeClose(s)
+		}
 		for _, group := range s.groups {
 			group.close()
 		}
+		close(s.done)
 	}
 }
 
@@ -124,10 +132,12 @@ type Plugin struct {
 	current      atomic.Pointer[runtimeState]
 	stateMu      sync.RWMutex
 	applyMu      sync.Mutex
+	cacheDumpMu  sync.Mutex
 	closed       atomic.Bool
 	token        []byte
 	snapshotFile string
 	backupFile   string
+	cacheDumpDir string
 	logger       *zap.Logger
 	metricsTag   string
 }
@@ -168,7 +178,11 @@ func newPlugin(args Args, logger *zap.Logger, metricsTag string) (*Plugin, error
 	if logger == nil {
 		logger = zap.NewNop()
 	}
-	p := &Plugin{token: token, snapshotFile: args.SnapshotFile, backupFile: args.BackupFile, logger: logger, metricsTag: metricsTag}
+	cacheDumpDir := args.CacheDumpDir
+	if cacheDumpDir == "" {
+		cacheDumpDir = args.SnapshotFile + ".cache"
+	}
+	p := &Plugin{token: token, snapshotFile: args.SnapshotFile, backupFile: args.BackupFile, cacheDumpDir: cacheDumpDir, logger: logger, metricsTag: metricsTag}
 	snapshot, source, err := loadSnapshot(args.SnapshotFile, args.BackupFile)
 	if err != nil {
 		return nil, err
@@ -180,7 +194,7 @@ func newPlugin(args Args, logger *zap.Logger, metricsTag string) (*Plugin, error
 			return nil, fmt.Errorf("migrate legacy groups: %w", err)
 		}
 	}
-	state, err := p.buildState(snapshot)
+	state, err := p.buildState(snapshot, true)
 	if err != nil {
 		return nil, fmt.Errorf("build initial snapshot: %w", err)
 	}
@@ -196,15 +210,16 @@ func newPlugin(args Args, logger *zap.Logger, metricsTag string) (*Plugin, error
 		}
 	}
 	p.current.Store(state)
+	p.cleanupCacheDumps(state)
 	return p, nil
 }
 
-func (p *Plugin) buildState(snapshot Snapshot) (*runtimeState, error) {
+func (p *Plugin) buildState(snapshot Snapshot, loadCacheDumps bool) (*runtimeState, error) {
 	canonicalSnapshot, err := canonicalWithoutRuntime(snapshot)
 	if err != nil {
 		return nil, err
 	}
-	state := &runtimeState{snapshot: canonicalSnapshot, groups: make(map[string]*runtimeGroup, len(canonicalSnapshot.Groups))}
+	state := &runtimeState{snapshot: canonicalSnapshot, groups: make(map[string]*runtimeGroup, len(canonicalSnapshot.Groups)), done: make(chan struct{})}
 	for _, config := range canonicalSnapshot.Groups {
 		forward, err := dynamic_forward.NewRuntime(config.Mode, config.Concurrent, config.Socks5, config.Upstreams, p.logger, p.metricsTag+"_"+config.ID)
 		if err != nil {
@@ -216,6 +231,17 @@ func (p *Plugin) buildState(snapshot Snapshot) (*runtimeState, error) {
 			_ = forward.Close()
 			state.retire()
 			return nil, fmt.Errorf("group %s cache: %w", config.ID, err)
+		}
+		if loadCacheDumps {
+			if f, err := os.Open(p.cacheDumpFile(canonicalSnapshot.Version, config.ID)); err == nil {
+				if _, err := cache.ReadDump(f); err != nil {
+					cache.Flush()
+					p.logger.Warn("skip invalid cache dump", zap.String("group", config.ID), zap.Error(err))
+				}
+				_ = f.Close()
+			} else if !errors.Is(err, os.ErrNotExist) {
+				p.logger.Warn("skip unreadable cache dump", zap.String("group", config.ID), zap.Error(err))
+			}
 		}
 		state.groups[config.ID] = &runtimeGroup{config: config, forward: forward, cache: cache}
 	}
@@ -298,10 +324,15 @@ func (p *Plugin) Close() error {
 	p.applyMu.Lock()
 	defer p.applyMu.Unlock()
 	p.stateMu.Lock()
-	defer p.stateMu.Unlock()
 	p.closed.Store(true)
-	if state := p.current.Swap(nil); state != nil {
+	state := p.current.Swap(nil)
+	if state != nil {
+		state.beforeClose = p.closeAndDumpCaches
 		state.retire()
+	}
+	p.stateMu.Unlock()
+	if state != nil {
+		<-state.done
 	}
 	return nil
 }
@@ -359,7 +390,7 @@ func (p *Plugin) handleSnapshot(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "version must increase")
 		return
 	}
-	next, err := p.buildState(requested)
+	next, err := p.buildState(requested, false)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
@@ -375,6 +406,9 @@ func (p *Plugin) handleSnapshot(w http.ResponseWriter, r *http.Request) {
 		next.retire()
 		writeError(w, http.StatusServiceUnavailable, "upstream registry changed while applying snapshot")
 		return
+	}
+	if err := p.removeCacheDumps(); err != nil {
+		p.logger.Warn("remove stale cache dumps", zap.Error(err))
 	}
 	old := p.current.Swap(next)
 	p.stateMu.Unlock()
@@ -408,12 +442,24 @@ func (p *Plugin) handleFlush(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		group.cache.Flush()
+		if err := p.removeCacheDump(state.snapshot.Version, request.GroupID); err != nil {
+			writeError(w, http.StatusInternalServerError, "remove cache dump: "+err.Error())
+			return
+		}
 	} else {
 		for _, group := range state.groups {
 			group.cache.Flush()
 		}
+		if err := p.removeCacheDumps(); err != nil {
+			writeError(w, http.StatusInternalServerError, "remove cache dumps: "+err.Error())
+			return
+		}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"flushed": true, "group_id": request.GroupID})
+}
+
+func (p *Plugin) cacheDumpFile(version uint64, groupID string) string {
+	return filepath.Join(p.cacheDumpDir, fmt.Sprintf("%d-%s.dump", version, groupID))
 }
 
 func decodeJSON(r *http.Request, target any, allowEmpty bool) error {

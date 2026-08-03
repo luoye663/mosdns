@@ -101,6 +101,23 @@ func Test_cachePlugin_Dump(t *testing.T) {
 	if second == nil || second.Answer[0].Header().Ttl >= first.Answer[0].Header().Ttl {
 		t.Fatalf("TTL did not decrease after reload: first=%d second=%v", first.Answer[0].Header().Ttl, second)
 	}
+
+	lazyCache := NewCache(&Args{Size: 16, LazyCacheTTL: 60}, Opts{})
+	defer lazyCache.Close()
+	lazyStored := time.Now().Add(-11 * time.Second)
+	lazyCache.backend.Store("lazy-entry", &item{resp: ttlResp, storedTime: lazyStored, expirationTime: lazyStored.Add(10 * time.Second)}, lazyStored.Add(70*time.Second))
+	lazyDump := new(bytes.Buffer)
+	if _, err := lazyCache.writeDump(lazyDump); err != nil {
+		t.Fatal(err)
+	}
+	lazyReloaded := NewCache(&Args{Size: 16, LazyCacheTTL: 60}, Opts{})
+	defer lazyReloaded.Close()
+	if _, err := lazyReloaded.readDump(lazyDump); err != nil {
+		t.Fatal(err)
+	}
+	if response, lazy := getRespFromCache("lazy-entry", lazyReloaded.backend, true, expiredMsgTtl); response == nil || !lazy {
+		t.Fatalf("lazy entry was not restored: response=%v lazy=%t", response, lazy)
+	}
 }
 
 func TestCacheAPIRequiresControlToken(t *testing.T) {
