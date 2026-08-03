@@ -174,33 +174,27 @@ func getRespFromCache(msgKey string, backend *cache.Cache[key, *item], lazyCache
 
 // saveRespToCache saves r to cache backend. It returns false if r
 // should not be cached and was skipped.
-func saveRespToCache(msgKey string, r *dns.Msg, backend *cache.Cache[key, *item], lazyCacheTtl int) bool {
+func saveRespToCache(msgKey string, r *dns.Msg, backend *cache.Cache[key, *item], lazyCacheTtl int, negativeConfig negativeCacheConfig) bool {
 	if r.Truncated != false {
 		return false
 	}
 
 	var msgTtl time.Duration
 	var cacheTtl time.Duration
-	switch r.Rcode {
-	case dns.RcodeNameError:
-		msgTtl = time.Second * 30
+	negativeTTL, negative := getNegativeTTL(r, negativeConfig)
+	if negative {
+		if negativeTTL == 0 {
+			return false
+		}
+		msgTtl = time.Duration(negativeTTL) * time.Second
 		cacheTtl = msgTtl
-	case dns.RcodeServerFailure:
-		msgTtl = time.Second * 5
-		cacheTtl = msgTtl
-	case dns.RcodeSuccess:
+	} else if r.Rcode == dns.RcodeSuccess {
 		minTTL := dnsutils.GetMinimalTTL(r)
-		if len(r.Answer) == 0 { // Empty answer. Set ttl between 0~300.
-			const maxEmtpyAnswerTtl = 300
-			msgTtl = time.Duration(min(minTTL, maxEmtpyAnswerTtl)) * time.Second
-			cacheTtl = msgTtl
+		msgTtl = time.Duration(minTTL) * time.Second
+		if lazyCacheTtl > 0 {
+			cacheTtl = time.Duration(lazyCacheTtl) * time.Second
 		} else {
-			msgTtl = time.Duration(minTTL) * time.Second
-			if lazyCacheTtl > 0 {
-				cacheTtl = time.Duration(lazyCacheTtl) * time.Second
-			} else {
-				cacheTtl = msgTtl
-			}
+			cacheTtl = msgTtl
 		}
 	}
 	if msgTtl <= 0 || cacheTtl <= 0 {
@@ -208,11 +202,71 @@ func saveRespToCache(msgKey string, r *dns.Msg, backend *cache.Cache[key, *item]
 	}
 
 	now := time.Now()
+	resp := copyNoOpt(r)
+	if negative {
+		capNegativeSOATTL(resp, negativeTTL)
+	}
 	v := &item{
-		resp:           copyNoOpt(r),
+		resp:           resp,
 		storedTime:     now,
 		expirationTime: now.Add(msgTtl),
 	}
 	backend.Store(key(msgKey), v, now.Add(cacheTtl))
+	return true
+}
+
+func getNegativeTTL(r *dns.Msg, config negativeCacheConfig) (uint32, bool) {
+	isNegative := r.Rcode == dns.RcodeNameError || isNODATA(r)
+	if !isNegative {
+		return 0, false
+	}
+	if !config.Enabled {
+		return 0, true
+	}
+
+	ttl := config.TTLSeconds
+	for _, rr := range r.Ns {
+		soa, ok := rr.(*dns.SOA)
+		if !ok {
+			continue
+		}
+		ttl = min(ttl, min(soa.Hdr.Ttl, soa.Minttl))
+	}
+	return ttl, true
+}
+
+func capNegativeSOATTL(r *dns.Msg, ttl uint32) {
+	for _, rr := range r.Ns {
+		if _, ok := rr.(*dns.SOA); ok && rr.Header().Ttl > ttl {
+			rr.Header().Ttl = ttl
+		}
+	}
+}
+
+func isNODATA(r *dns.Msg) bool {
+	if r.Rcode != dns.RcodeSuccess {
+		return false
+	}
+	if len(r.Answer) > 0 {
+		if len(r.Question) != 1 || r.Question[0].Qtype == dns.TypeANY {
+			return false
+		}
+		qtype := r.Question[0].Qtype
+		for _, rr := range r.Answer {
+			if rr.Header().Rrtype == qtype {
+				return false
+			}
+		}
+	}
+
+	hasSOA := false
+	hasNS := false
+	for _, rr := range r.Ns {
+		hasSOA = hasSOA || rr.Header().Rrtype == dns.TypeSOA
+		hasNS = hasNS || rr.Header().Rrtype == dns.TypeNS
+	}
+	if hasNS && !hasSOA {
+		return false
+	}
 	return true
 }

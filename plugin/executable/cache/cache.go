@@ -62,6 +62,8 @@ func init() {
 const (
 	defaultLazyUpdateTimeout = time.Second * 5
 	expiredMsgTtl            = 5
+	defaultNegativeCacheTTL  = 30
+	maxNegativeCacheTTL      = 86400
 
 	minimumChangesToDump   = 1024
 	dumpHeader             = "mosdns_cache_v2"
@@ -88,20 +90,26 @@ func (a *Args) init() {
 type Cache struct {
 	args *Args
 
-	logger       *zap.Logger
-	backend      *cache.Cache[key, *item]
-	lazyUpdateSF singleflight.Group
-	closeOnce    sync.Once
-	closeNotify  chan struct{}
-	updatedKey   atomic.Uint64
-	enabled      atomic.Bool
-	lazyCacheTTL atomic.Int64
-	controlToken []byte
+	logger        *zap.Logger
+	backend       *cache.Cache[key, *item]
+	lazyUpdateSF  singleflight.Group
+	closeOnce     sync.Once
+	closeNotify   chan struct{}
+	updatedKey    atomic.Uint64
+	enabled       atomic.Bool
+	lazyCacheTTL  atomic.Int64
+	negativeCache atomic.Pointer[negativeCacheConfig]
+	controlToken  []byte
 
 	queryTotal   prometheus.Counter
 	hitTotal     prometheus.Counter
 	lazyHitTotal prometheus.Counter
 	size         prometheus.GaugeFunc
+}
+
+type negativeCacheConfig struct {
+	Enabled    bool   `json:"enabled"`
+	TTLSeconds uint32 `json:"ttl_seconds"`
 }
 
 func Init(bp *coremain.BP, args any) (any, error) {
@@ -191,6 +199,7 @@ func NewCache(args *Args, opts Opts) *Cache {
 	}
 	p.enabled.Store(true)
 	p.lazyCacheTTL.Store(int64(args.LazyCacheTTL))
+	p.negativeCache.Store(&negativeCacheConfig{Enabled: true, TTLSeconds: defaultNegativeCacheTTL})
 
 	if err := p.loadDump(); err != nil {
 		p.logger.Error("failed to load cache dump", zap.Error(err))
@@ -235,9 +244,10 @@ func (c *Cache) Exec(ctx context.Context, qCtx *query_context.Context, next sequ
 
 	err := next.ExecNext(ctx, qCtx)
 
-	if r := qCtx.R(); r != nil && cachedResp != r { // pointer compare. r is not cachedResp
-		saveRespToCache(msgKey, r, c.backend, lazyTTL)
-		c.updatedKey.Add(1)
+	if r := qCtx.R(); err == nil && r != nil && cachedResp != r { // pointer compare. r is not cachedResp
+		if saveRespToCache(msgKey, r, c.backend, lazyTTL, *c.negativeCache.Load()) {
+			c.updatedKey.Add(1)
+		}
 	}
 	return err
 }
@@ -260,9 +270,10 @@ func (c *Cache) doLazyUpdate(msgKey string, qCtx *query_context.Context, next se
 		}
 
 		r := qCtx.R()
-		if r != nil {
-			saveRespToCache(msgKey, r, c.backend, int(c.lazyCacheTTL.Load()))
-			c.updatedKey.Add(1)
+		if err == nil && r != nil {
+			if saveRespToCache(msgKey, r, c.backend, int(c.lazyCacheTTL.Load()), *c.negativeCache.Load()) {
+				c.updatedKey.Add(1)
+			}
 		}
 		c.logger.Debug("lazy cache updated", qCtx.InfoField())
 		return nil, nil
@@ -390,6 +401,29 @@ func (c *Cache) Api() *chi.Mux {
 		w.Header().Set("content-type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]int{"ttl": body.TTL})
 	})
+	r.Get("/negative-cache", func(w http.ResponseWriter, req *http.Request) {
+		w.Header().Set("content-type", "application/json")
+		_ = json.NewEncoder(w).Encode(c.negativeCache.Load())
+	})
+	r.Put("/negative-cache", func(w http.ResponseWriter, req *http.Request) {
+		var body struct {
+			Enabled    *bool   `json:"enabled"`
+			TTLSeconds *uint32 `json:"ttl_seconds"`
+		}
+		decoder := json.NewDecoder(io.LimitReader(req.Body, 1025))
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&body); err != nil || decoder.Decode(&struct{}{}) != io.EOF || body.Enabled == nil || body.TTLSeconds == nil || *body.TTLSeconds < 1 || *body.TTLSeconds > maxNegativeCacheTTL {
+			http.Error(w, "invalid request", http.StatusBadRequest)
+			return
+		}
+		config := &negativeCacheConfig{Enabled: *body.Enabled, TTLSeconds: *body.TTLSeconds}
+		if current := c.negativeCache.Load(); *current != *config {
+			c.negativeCache.Store(config)
+			c.backend.Flush()
+		}
+		w.Header().Set("content-type", "application/json")
+		_ = json.NewEncoder(w).Encode(config)
+	})
 	r.Get("/dump", func(w http.ResponseWriter, req *http.Request) {
 		w.Header().Set("content-type", "application/octet-stream")
 		_, err := c.writeDump(w)
@@ -464,6 +498,7 @@ func (c *Cache) writeDump(w io.Writer) (int, error) {
 			Key:                 []byte(k),
 			CacheExpirationTime: cacheExpirationTime.Unix(),
 			MsgExpirationTime:   v.expirationTime.Unix(),
+			MsgStoredTime:       v.storedTime.Unix(),
 			Msg:                 msg,
 		}
 		block.Entries = append(block.Entries, e)
@@ -526,14 +561,33 @@ func (c *Cache) readDump(r io.Reader) (int, error) {
 			return fmt.Errorf("failed to decode block data, %w", err)
 		}
 
-		en += len(block.GetEntries())
 		for _, entry := range block.GetEntries() {
+			if entry.GetMsgStoredTime() <= 0 {
+				continue
+			}
 			cacheExpTime := time.Unix(entry.GetCacheExpirationTime(), 0)
 			msgExpTime := time.Unix(entry.GetMsgExpirationTime(), 0)
 			storedTime := time.Unix(entry.GetMsgStoredTime(), 0)
 			resp := new(dns.Msg)
 			if err := resp.Unpack(entry.GetMsg()); err != nil {
 				return fmt.Errorf("failed to decode dns msg, %w", err)
+			}
+			negativeTTL, negative := getNegativeTTL(resp, *c.negativeCache.Load())
+			if resp.Truncated || negative && negativeTTL == 0 || !negative && resp.Rcode != dns.RcodeSuccess {
+				continue
+			}
+			if negative {
+				configuredExpiration := storedTime.Add(time.Duration(negativeTTL) * time.Second)
+				if configuredExpiration.Before(msgExpTime) {
+					msgExpTime = configuredExpiration
+				}
+				if configuredExpiration.Before(cacheExpTime) {
+					cacheExpTime = configuredExpiration
+				}
+				capNegativeSOATTL(resp, negativeTTL)
+			}
+			if !time.Now().Before(msgExpTime) || !time.Now().Before(cacheExpTime) {
+				continue
 			}
 
 			i := &item{
@@ -542,6 +596,7 @@ func (c *Cache) readDump(r io.Reader) (int, error) {
 				expirationTime: msgExpTime,
 			}
 			c.backend.Store(key(entry.GetKey()), i, cacheExpTime)
+			en++
 		}
 		return nil
 	}

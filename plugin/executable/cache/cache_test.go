@@ -21,16 +21,26 @@ package cache
 
 import (
 	"bytes"
-	"github.com/miekg/dns"
+	"compress/gzip"
+	"context"
+	"encoding/binary"
+	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
 	"testing"
 	"time"
+
+	"github.com/IrineSistiana/mosdns/v5/pkg/query_context"
+	"github.com/IrineSistiana/mosdns/v5/plugin/executable/sequence"
+	"github.com/miekg/dns"
+	"google.golang.org/protobuf/proto"
 )
 
 func Test_cachePlugin_Dump(t *testing.T) {
 	c := NewCache(&Args{Size: 16 * dumpBlockSize}, Opts{}) // Big enough to create dump fragments.
+	defer c.Close()
 
 	resp := new(dns.Msg)
 	resp.SetQuestion("test.", dns.TypeA)
@@ -53,13 +63,41 @@ func Test_cachePlugin_Dump(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	enr, err := c.readDump(buf)
+
+	reloaded := NewCache(&Args{Size: 16 * dumpBlockSize}, Opts{})
+	defer reloaded.Close()
+	enr, err := reloaded.readDump(buf)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	if enw != enr {
 		t.Fatalf("read err, wrote %d entries, read %d", enw, enr)
+	}
+
+	ttlCache := NewCache(&Args{Size: 16}, Opts{})
+	defer ttlCache.Close()
+	ttlResp := resp.Copy()
+	ttlResp.Answer = []dns.RR{&dns.A{Hdr: dns.RR_Header{Name: "test.", Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 10}}}
+	storedTime := time.Now().Add(-2 * time.Second)
+	ttlCache.backend.Store("ttl-entry", &item{resp: ttlResp, storedTime: storedTime, expirationTime: storedTime.Add(10 * time.Second)}, storedTime.Add(10*time.Second))
+	ttlDump := new(bytes.Buffer)
+	if _, err := ttlCache.writeDump(ttlDump); err != nil {
+		t.Fatal(err)
+	}
+	ttlReloaded := NewCache(&Args{Size: 16}, Opts{})
+	defer ttlReloaded.Close()
+	if _, err := ttlReloaded.readDump(ttlDump); err != nil {
+		t.Fatal(err)
+	}
+	first, _ := getRespFromCache("ttl-entry", ttlReloaded.backend, false, 0)
+	if first == nil {
+		t.Fatal("reloaded entry was not found")
+	}
+	time.Sleep(1100 * time.Millisecond)
+	second, _ := getRespFromCache("ttl-entry", ttlReloaded.backend, false, 0)
+	if second == nil || second.Answer[0].Header().Ttl >= first.Answer[0].Header().Ttl {
+		t.Fatalf("TTL did not decrease after reload: first=%d second=%v", first.Answer[0].Header().Ttl, second)
 	}
 }
 
@@ -128,4 +166,204 @@ func TestCacheTTLAPIFlushesExistingEntries(t *testing.T) {
 	if response.Code != http.StatusOK || c.lazyCacheTTL.Load() != 60 || c.backend.Len() != 0 {
 		t.Fatalf("status=%d ttl=%d entries=%d", response.Code, c.lazyCacheTTL.Load(), c.backend.Len())
 	}
+}
+
+func TestNegativeCacheResponses(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		response   *dns.Msg
+		config     negativeCacheConfig
+		wantStored bool
+		wantTTL    uint32
+	}{
+		{name: "NXDOMAIN defaults without SOA", response: negativeResponse(dns.RcodeNameError, false), config: negativeCacheConfig{Enabled: true, TTLSeconds: 30}, wantStored: true, wantTTL: 30},
+		{name: "NODATA without SOA", response: negativeResponse(dns.RcodeSuccess, false), config: negativeCacheConfig{Enabled: true, TTLSeconds: 45}, wantStored: true, wantTTL: 45},
+		{name: "CNAME-only NODATA", response: cnameOnlyResponse(), config: negativeCacheConfig{Enabled: true, TTLSeconds: 30}, wantStored: true, wantTTL: 30},
+		{name: "referral is not NODATA", response: referralResponse(), config: negativeCacheConfig{Enabled: false, TTLSeconds: 30}, wantStored: true, wantTTL: 300},
+		{name: "SOA TTL capped by config", response: negativeResponse(dns.RcodeNameError, true), config: negativeCacheConfig{Enabled: true, TTLSeconds: 20}, wantStored: true, wantTTL: 20},
+		{name: "SOA minimum caps config", response: negativeResponse(dns.RcodeNameError, true), config: negativeCacheConfig{Enabled: true, TTLSeconds: 300}, wantStored: true, wantTTL: 60},
+		{name: "NXDOMAIN disabled", response: negativeResponse(dns.RcodeNameError, false), config: negativeCacheConfig{Enabled: false, TTLSeconds: 30}},
+		{name: "NODATA disabled", response: negativeResponse(dns.RcodeSuccess, false), config: negativeCacheConfig{Enabled: false, TTLSeconds: 30}},
+		{name: "SERVFAIL", response: negativeResponse(dns.RcodeServerFailure, false), config: negativeCacheConfig{Enabled: true, TTLSeconds: 30}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			c := NewCache(&Args{Size: 16}, Opts{})
+			defer c.Close()
+			stored := saveRespToCache("key", test.response, c.backend, 0, test.config)
+			if stored != test.wantStored || c.backend.Len() != boolToInt(test.wantStored) {
+				t.Fatalf("stored=%t entries=%d", stored, c.backend.Len())
+			}
+			if test.wantStored {
+				entry, expiration, ok := c.backend.Get("key")
+				if !ok {
+					t.Fatal("stored entry not found")
+				}
+				remaining := uint32(time.Until(expiration).Round(time.Second) / time.Second)
+				if remaining != test.wantTTL {
+					t.Fatalf("cache TTL=%d want=%d", remaining, test.wantTTL)
+				}
+				if len(entry.resp.Ns) > 0 && entry.resp.Ns[0].Header().Ttl > test.wantTTL {
+					t.Fatalf("SOA TTL=%d exceeds cache TTL=%d", entry.resp.Ns[0].Header().Ttl, test.wantTTL)
+				}
+			}
+		})
+	}
+}
+
+func TestCacheDoesNotStoreResponseWhenExecutionFails(t *testing.T) {
+	c := NewCache(&Args{Size: 16}, Opts{})
+	defer c.Close()
+	query := new(dns.Msg)
+	query.SetQuestion("error.example.", dns.TypeA)
+	qCtx := query_context.NewContext(query)
+	wantErr := errors.New("upstream failed")
+	next := sequence.NewChainWalker([]*sequence.ChainNode{{E: sequence.ExecutableFunc(func(_ context.Context, qCtx *query_context.Context) error {
+		qCtx.SetResponse(negativeResponse(dns.RcodeNameError, false))
+		return wantErr
+	})}}, nil)
+	if err := c.Exec(context.Background(), qCtx, next); !errors.Is(err, wantErr) {
+		t.Fatalf("error=%v want=%v", err, wantErr)
+	}
+	if c.backend.Len() != 0 {
+		t.Fatalf("execution error cached %d entries", c.backend.Len())
+	}
+}
+
+func TestNegativeCacheAPI(t *testing.T) {
+	c := NewCache(&Args{Size: 16}, Opts{})
+	defer c.Close()
+	c.controlToken = []byte("cache-test-token")
+
+	response := cacheAPIRequest(c, http.MethodGet, "/negative-cache", "")
+	var initial negativeCacheConfig
+	if response.Code != http.StatusOK || json.NewDecoder(response.Body).Decode(&initial) != nil || !initial.Enabled || initial.TTLSeconds != defaultNegativeCacheTTL {
+		t.Fatalf("default response status=%d config=%+v", response.Code, initial)
+	}
+
+	for _, test := range []struct {
+		name string
+		body string
+		want int
+	}{
+		{name: "minimum", body: `{"enabled":true,"ttl_seconds":1}`, want: http.StatusOK},
+		{name: "maximum and disabled", body: `{"enabled":false,"ttl_seconds":86400}`, want: http.StatusOK},
+		{name: "zero", body: `{"enabled":false,"ttl_seconds":0}`, want: http.StatusBadRequest},
+		{name: "too large", body: `{"enabled":true,"ttl_seconds":86401}`, want: http.StatusBadRequest},
+		{name: "negative", body: `{"enabled":true,"ttl_seconds":-1}`, want: http.StatusBadRequest},
+		{name: "missing TTL", body: `{"enabled":true}`, want: http.StatusBadRequest},
+		{name: "missing enabled", body: `{"ttl_seconds":30}`, want: http.StatusBadRequest},
+		{name: "unknown field", body: `{"enabled":true,"ttl_seconds":30,"extra":1}`, want: http.StatusBadRequest},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			c.backend.Store("entry", &item{}, time.Now().Add(time.Hour))
+			response := cacheAPIRequest(c, http.MethodPut, "/negative-cache", test.body)
+			if response.Code != test.want {
+				t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+			}
+			if test.want == http.StatusOK && c.backend.Len() != 0 {
+				t.Fatalf("configuration change left %d entries", c.backend.Len())
+			}
+			c.backend.Flush()
+		})
+	}
+
+	response = cacheAPIRequest(c, http.MethodGet, "/negative-cache", "")
+	var current negativeCacheConfig
+	if response.Code != http.StatusOK || json.NewDecoder(response.Body).Decode(&current) != nil || current.Enabled || current.TTLSeconds != maxNegativeCacheTTL {
+		t.Fatalf("current response status=%d config=%+v", response.Code, current)
+	}
+}
+
+func TestNegativeCacheAPIKeepsEntriesWhenConfigurationIsUnchanged(t *testing.T) {
+	c := NewCache(&Args{Size: 16}, Opts{})
+	defer c.Close()
+	c.controlToken = []byte("cache-test-token")
+	c.backend.Store("entry", &item{}, time.Now().Add(time.Hour))
+
+	response := cacheAPIRequest(c, http.MethodPut, "/negative-cache", `{"enabled":true,"ttl_seconds":30}`)
+	if response.Code != http.StatusOK || c.backend.Len() != 1 {
+		t.Fatalf("status=%d entries=%d", response.Code, c.backend.Len())
+	}
+}
+
+func TestReadDumpSkipsEntriesWithoutStoredTime(t *testing.T) {
+	resp := new(dns.Msg)
+	resp.SetQuestion("legacy.example.", dns.TypeA)
+	resp.Response = true
+	resp.Answer = []dns.RR{&dns.A{Hdr: dns.RR_Header{Name: "legacy.example.", Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 60}}}
+	packed, err := resp.Pack()
+	if err != nil {
+		t.Fatal(err)
+	}
+	block, err := proto.Marshal(&CacheDumpBlock{Entries: []*CachedEntry{{
+		Key:                 []byte("legacy"),
+		CacheExpirationTime: time.Now().Add(time.Minute).Unix(),
+		MsgExpirationTime:   time.Now().Add(time.Minute).Unix(),
+		Msg:                 packed,
+	}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var dump bytes.Buffer
+	writer, err := gzip.NewWriterLevel(&dump, gzip.BestSpeed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writer.Name = dumpHeader
+	length := make([]byte, 8)
+	binary.BigEndian.PutUint64(length, uint64(len(block)))
+	if _, err := writer.Write(length); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := writer.Write(block); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	c := NewCache(&Args{Size: 16}, Opts{})
+	defer c.Close()
+	loaded, err := c.readDump(&dump)
+	if err != nil || loaded != 0 || c.backend.Len() != 0 {
+		t.Fatalf("loaded=%d entries=%d err=%v", loaded, c.backend.Len(), err)
+	}
+}
+
+func negativeResponse(rcode int, withSOA bool) *dns.Msg {
+	response := new(dns.Msg)
+	response.SetQuestion("negative.example.", dns.TypeA)
+	response.Response = true
+	response.Rcode = rcode
+	if withSOA {
+		response.Ns = []dns.RR{&dns.SOA{Hdr: dns.RR_Header{Name: "example.", Rrtype: dns.TypeSOA, Class: dns.ClassINET, Ttl: 120}, Minttl: 60}}
+	}
+	return response
+}
+
+func cnameOnlyResponse() *dns.Msg {
+	response := negativeResponse(dns.RcodeSuccess, false)
+	response.Answer = []dns.RR{&dns.CNAME{Hdr: dns.RR_Header{Name: "negative.example.", Rrtype: dns.TypeCNAME, Class: dns.ClassINET, Ttl: 300}, Target: "missing.example."}}
+	return response
+}
+
+func referralResponse() *dns.Msg {
+	response := negativeResponse(dns.RcodeSuccess, false)
+	response.Ns = []dns.RR{&dns.NS{Hdr: dns.RR_Header{Name: "example.", Rrtype: dns.TypeNS, Class: dns.ClassINET, Ttl: 300}, Ns: "ns.example."}}
+	return response
+}
+
+func boolToInt(value bool) int {
+	if value {
+		return 1
+	}
+	return 0
+}
+
+func cacheAPIRequest(c *Cache, method, path, body string) *httptest.ResponseRecorder {
+	request := httptest.NewRequest(method, path, bytes.NewBufferString(body))
+	request.Header.Set("Authorization", "Bearer cache-test-token")
+	response := httptest.NewRecorder()
+	c.Api().ServeHTTP(response, request)
+	return response
 }
