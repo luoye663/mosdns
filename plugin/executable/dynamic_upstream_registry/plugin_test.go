@@ -62,7 +62,11 @@ func group(id, name, addr string) Group {
 }
 
 func snapshot(version uint64, groups ...Group) Snapshot {
-	return Snapshot{Version: version, DefaultGroupID: groups[0].ID, Groups: groups, Cache: GlobalCacheConfig{Enabled: true, Negative: NegativeCacheConfig{Enabled: true, TTL: 30}}}
+	defaultGroupID := ""
+	if len(groups) > 0 {
+		defaultGroupID = groups[0].ID
+	}
+	return Snapshot{SchemaVersion: registrySchemaVersion, Version: version, DefaultGroupID: defaultGroupID, Groups: groups, Cache: GlobalCacheConfig{Enabled: true, Negative: NegativeCacheConfig{Enabled: true, TTL: 30}}}
 }
 
 func newTestPlugin(t *testing.T, initial Snapshot) (*Plugin, Args) {
@@ -81,7 +85,7 @@ func newTestPlugin(t *testing.T, initial Snapshot) (*Plugin, Args) {
 	return p, args
 }
 
-func newMigrationArgs(t *testing.T, initial Snapshot) (Args, string) {
+func newTestArgs(t *testing.T, initial Snapshot) (Args, string) {
 	t.Helper()
 	dir := t.TempDir()
 	tokenFile := filepath.Join(dir, "token")
@@ -89,17 +93,6 @@ func newMigrationArgs(t *testing.T, initial Snapshot) (Args, string) {
 		t.Fatal(err)
 	}
 	return Args{AuthTokenFile: tokenFile, SnapshotFile: filepath.Join(dir, "registry-current.json"), BackupFile: filepath.Join(dir, "registry-backup.json"), InitialSnapshot: initial}, dir
-}
-
-func writeTestJSON(t *testing.T, filename string, value any) {
-	t.Helper()
-	data, err := json.Marshal(value)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filename, data, 0o600); err != nil {
-		t.Fatal(err)
-	}
 }
 
 func query(name string) *query_context.Context {
@@ -144,8 +137,9 @@ func TestCanonicalSnapshotValidation(t *testing.T) {
 		t.Fatalf("canonical = %+v", canonical)
 	}
 	for name, mutate := range map[string]func(*Snapshot){
+		"schema":           func(s *Snapshot) { s.SchemaVersion = 0 },
 		"version":          func(s *Snapshot) { s.Version = 0 },
-		"id":               func(s *Snapshot) { s.Groups[0].ID = "Invalid"; s.DefaultGroupID = "Invalid" },
+		"id":               func(s *Snapshot) { s.Groups[0].ID = "Invalid" },
 		"missing default":  func(s *Snapshot) { s.DefaultGroupID = "missing" },
 		"disabled default": func(s *Snapshot) { s.Groups[0].Enabled = false },
 		"cache total":      func(s *Snapshot) { s.Groups[0].Cache.Size = maximumCacheEntries + 1 },
@@ -163,29 +157,27 @@ func TestCanonicalSnapshotValidation(t *testing.T) {
 	}
 }
 
+func TestRegistryRejectsPersistedSnapshotWithoutSchemaVersion(t *testing.T) {
+	initial := snapshot(1, group("default", "Default", "udp://127.0.0.1:53"))
+	args, _ := newTestArgs(t, initial)
+	if err := os.WriteFile(args.SnapshotFile, []byte(`{"version":1,"groups":[]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := newPlugin(args, zap.NewNop(), "missing-schema"); err == nil {
+		t.Fatal("persisted registry snapshot without schema_version was accepted")
+	}
+}
+
 func TestSelectionPriorityAndMetadata(t *testing.T) {
 	def := startDNSServer(t, "192.0.2.1", dns.RcodeSuccess, nil)
-	local := startDNSServer(t, "192.0.2.2", dns.RcodeSuccess, nil)
-	remote := startDNSServer(t, "192.0.2.3", dns.RcodeSuccess, nil)
 	custom := startDNSServer(t, "192.0.2.4", dns.RcodeSuccess, nil)
-	p, _ := newTestPlugin(t, snapshot(1, group("default", "Default Group", def.addr), group("local_dns", "Local", local.addr), group("remote_dns", "Remote", remote.addr), group("custom", "Custom", custom.addr)))
+	p, _ := newTestPlugin(t, snapshot(1, group("default", "Default Group", def.addr), group("custom", "Custom", custom.addr)))
 	for _, test := range []struct {
 		name, wantIP, wantID, source string
 		setup                        func(*query_context.Context)
 	}{
 		{name: "default", wantIP: "192.0.2.1", wantID: "default", source: "default", setup: func(*query_context.Context) {}},
-		{name: "local mark", wantIP: "192.0.2.2", wantID: "local_dns", source: "dynamic_rule", setup: func(q *query_context.Context) { q.SetMark(routeLocalMark) }},
-		{name: "remote mark", wantIP: "192.0.2.3", wantID: "remote_dns", source: "dynamic_rule", setup: func(q *query_context.Context) { q.SetMark(routeRemoteMark) }},
-		{name: "local subscription mark", wantIP: "192.0.2.2", wantID: "local_dns", source: "subscription", setup: func(q *query_context.Context) {
-			q.SetMark(routeLocalMark)
-			q.SetMark(subscriptionLocalMark)
-		}},
-		{name: "remote subscription mark", wantIP: "192.0.2.3", wantID: "remote_dns", source: "subscription", setup: func(q *query_context.Context) {
-			q.SetMark(routeRemoteMark)
-			q.SetMark(subscriptionRemoteMark)
-		}},
-		{name: "explicit wins", wantIP: "192.0.2.4", wantID: "custom", source: "subscription", setup: func(q *query_context.Context) {
-			q.SetMark(routeLocalMark)
+		{name: "explicit", wantIP: "192.0.2.4", wantID: "custom", source: "subscription", setup: func(q *query_context.Context) {
 			query_context.SetUpstreamGroupID(q, "custom")
 		}},
 	} {
@@ -207,9 +199,9 @@ func TestSelectionPriorityAndMetadata(t *testing.T) {
 }
 
 func TestManualRuntimeDecisionWinsExplicitSubscriptionGroup(t *testing.T) {
-	local := startDNSServer(t, "192.0.2.2", dns.RcodeSuccess, nil)
+	manual := startDNSServer(t, "192.0.2.2", dns.RcodeSuccess, nil)
 	custom := startDNSServer(t, "192.0.2.4", dns.RcodeSuccess, nil)
-	p, _ := newTestPlugin(t, snapshot(1, group("local_dns", "Local", local.addr), group("custom", "Custom", custom.addr)))
+	p, _ := newTestPlugin(t, snapshot(1, group("manual_group", "Manual", manual.addr), group("custom", "Custom", custom.addr)))
 
 	dir := t.TempDir()
 	tokenFile := filepath.Join(dir, "rule-token")
@@ -219,7 +211,7 @@ func TestManualRuntimeDecisionWinsExplicitSubscriptionGroup(t *testing.T) {
 	}
 	ruleSnapshot := dynamic_rule_engine.Snapshot{
 		SchemaVersion: dynamic_rule_engine.SchemaVersion, Version: 1, BlockRCode: dns.RcodeNameError,
-		Rules: []dynamic_rule_engine.Rule{{ID: 1, Category: dynamic_rule_engine.CategoryRoute, Action: dynamic_rule_engine.ActionLocal, MatchType: dynamic_rule_engine.MatchTypeFull, Pattern: "manual.example"}},
+		Rules: []dynamic_rule_engine.Rule{{ID: 1, Category: dynamic_rule_engine.CategoryRoute, Action: dynamic_rule_engine.ActionUpstream, UpstreamGroupID: "manual_group", MatchType: dynamic_rule_engine.MatchTypeFull, Pattern: "manual.example"}},
 	}
 	data, err := json.Marshal(ruleSnapshot)
 	if err != nil {
@@ -247,7 +239,7 @@ func TestManualRuntimeDecisionWinsExplicitSubscriptionGroup(t *testing.T) {
 		t.Fatal(err)
 	}
 	meta, ok := query_context.UpstreamRuntimeMetaFromContext(qCtx)
-	if got := answerIP(t, qCtx); got != "192.0.2.2" || !ok || meta.GroupID != "local_dns" || meta.RouteSource != "dynamic_rule" {
+	if got := answerIP(t, qCtx); got != "192.0.2.2" || !ok || meta.GroupID != "manual_group" || meta.RouteSource != "dynamic_rule" {
 		t.Fatalf("answer=%s metadata=%+v present=%t", got, meta, ok)
 	}
 }
@@ -416,7 +408,7 @@ func TestInvalidCacheDumpsAreSkipped(t *testing.T) {
 		}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			args, _ := newMigrationArgs(t, snapshot(1, group("default", "Default", server.addr)))
+			args, _ := newTestArgs(t, snapshot(1, group("default", "Default", server.addr)))
 			args.CacheDumpDir = filepath.Join(filepath.Dir(args.SnapshotFile), "cache")
 			if err := os.MkdirAll(args.CacheDumpDir, 0o750); err != nil {
 				t.Fatal(err)
@@ -509,116 +501,6 @@ func TestSnapshotCASPersistenceAndBackupRecovery(t *testing.T) {
 	}
 }
 
-func TestLegacyMigrationKeepsInitialWhenFilesDoNotExist(t *testing.T) {
-	initial := snapshot(1, group("default", "Initial", "udp://127.0.0.1:5301"))
-	args, dir := newMigrationArgs(t, initial)
-	args.LegacyGroups = []LegacyGroup{{
-		ID: "default", ForwardSnapshotFile: filepath.Join(dir, "forward-current.json"), ForwardBackupFile: filepath.Join(dir, "forward-backup.json"),
-		ECSSnapshotFile: filepath.Join(dir, "ecs-current.json"), ECSBackupFile: filepath.Join(dir, "ecs-backup.json"),
-	}}
-	p, err := newPlugin(args, zap.NewNop(), "legacy-none")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer p.Close()
-	got := p.current.Load().snapshot.Groups[0]
-	if got.Name != "Initial" || got.Upstreams[0].Addr != "udp://127.0.0.1:5301" || got.ECS.Mode != "off" {
-		t.Fatalf("initial group changed: %+v", got)
-	}
-	if _, err := os.Stat(args.SnapshotFile); err != nil {
-		t.Fatalf("registry current was not persisted: %v", err)
-	}
-}
-
-func TestLegacyMigrationImportsAndStopsReadingLegacyAfterPersist(t *testing.T) {
-	initial := snapshot(7, group("default", "Initial", "udp://127.0.0.1:5301"))
-	args, dir := newMigrationArgs(t, initial)
-	legacy := LegacyGroup{
-		ID: "default", ForwardSnapshotFile: filepath.Join(dir, "forward-current.json"), ForwardBackupFile: filepath.Join(dir, "forward-backup.json"),
-		ECSSnapshotFile: filepath.Join(dir, "ecs-current.json"), ECSBackupFile: filepath.Join(dir, "ecs-backup.json"),
-	}
-	args.LegacyGroups = []LegacyGroup{legacy}
-	writeTestJSON(t, legacy.ForwardSnapshotFile, dynamic_forward.Snapshot{Version: 4, Mode: "weighted", Concurrent: 2, Socks5: "127.0.0.1:1080", Upstreams: []dynamic_forward.Upstream{{Tag: "legacy", Addr: "udp://127.0.0.1:5353", Weight: 9, Priority: 20}}})
-	writeTestJSON(t, legacy.ECSSnapshotFile, dynamic_ecs.Snapshot{Version: 3, Mode: "fixed_subnet", Preset4: "203.0.113.9/24"})
-	p, err := newPlugin(args, zap.NewNop(), "legacy-success")
-	if err != nil {
-		t.Fatal(err)
-	}
-	got := p.current.Load().snapshot.Groups[0]
-	if got.Mode != "weighted" || got.Concurrent != 2 || got.Socks5 != "127.0.0.1:1080" || got.Upstreams[0].Tag != "legacy" {
-		t.Fatalf("forward migration = %+v", got)
-	}
-	if got.ECS.Mode != "fixed_subnet" || got.ECS.Preset4 != "203.0.113.0/24" {
-		t.Fatalf("ECS migration = %+v", got.ECS)
-	}
-	if gotSnapshot := p.current.Load().snapshot; gotSnapshot.Version != initial.Version {
-		t.Fatalf("registry version = %d, want %d", gotSnapshot.Version, initial.Version)
-	}
-	if err := p.Close(); err != nil {
-		t.Fatal(err)
-	}
-	for _, filename := range []string{legacy.ForwardSnapshotFile, legacy.ECSSnapshotFile} {
-		if err := os.WriteFile(filename, []byte("corrupt after migration"), 0o600); err != nil {
-			t.Fatal(err)
-		}
-	}
-	restarted, err := newPlugin(args, zap.NewNop(), "legacy-restart")
-	if err != nil {
-		t.Fatalf("restart reread legacy files: %v", err)
-	}
-	defer restarted.Close()
-	if got := restarted.current.Load().snapshot.Groups[0]; got.Upstreams[0].Tag != "legacy" || got.ECS.Preset4 != "203.0.113.0/24" {
-		t.Fatalf("persisted migration = %+v", got)
-	}
-}
-
-func TestLegacyMigrationRecoversBothSnapshotsFromBackup(t *testing.T) {
-	initial := snapshot(1, group("default", "Initial", "udp://127.0.0.1:5301"))
-	args, dir := newMigrationArgs(t, initial)
-	legacy := LegacyGroup{
-		ID: "default", ForwardSnapshotFile: filepath.Join(dir, "forward-current.json"), ForwardBackupFile: filepath.Join(dir, "forward-backup.json"),
-		ECSSnapshotFile: filepath.Join(dir, "ecs-current.json"), ECSBackupFile: filepath.Join(dir, "ecs-backup.json"),
-	}
-	args.LegacyGroups = []LegacyGroup{legacy}
-	for _, filename := range []string{legacy.ForwardSnapshotFile, legacy.ECSSnapshotFile} {
-		if err := os.WriteFile(filename, []byte(`{"unknown":true}`), 0o600); err != nil {
-			t.Fatal(err)
-		}
-	}
-	writeTestJSON(t, legacy.ForwardBackupFile, dynamic_forward.Snapshot{Version: 2, Mode: "failover", Concurrent: 1, Upstreams: []dynamic_forward.Upstream{{Tag: "backup", Addr: "udp://127.0.0.1:5354", Priority: 1}}})
-	writeTestJSON(t, legacy.ECSBackupFile, dynamic_ecs.Snapshot{Version: 2, Mode: "client_subnet", Mask4: 20, Mask6: 56})
-	p, err := newPlugin(args, zap.NewNop(), "legacy-backup")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer p.Close()
-	got := p.current.Load().snapshot.Groups[0]
-	if got.Mode != "failover" || got.Upstreams[0].Tag != "backup" || got.ECS.Mode != "client_subnet" || got.ECS.Mask4 != 20 || got.ECS.Mask6 != 56 {
-		t.Fatalf("backup migration = %+v", got)
-	}
-}
-
-func TestLegacyMigrationFailsWhenExistingSnapshotsAreAllInvalid(t *testing.T) {
-	initial := snapshot(1, group("default", "Initial", "udp://127.0.0.1:5301"))
-	args, dir := newMigrationArgs(t, initial)
-	legacy := LegacyGroup{
-		ID: "default", ForwardSnapshotFile: filepath.Join(dir, "forward-current.json"), ForwardBackupFile: filepath.Join(dir, "forward-backup.json"),
-		ECSSnapshotFile: filepath.Join(dir, "ecs-current.json"), ECSBackupFile: filepath.Join(dir, "ecs-backup.json"),
-	}
-	args.LegacyGroups = []LegacyGroup{legacy}
-	for _, filename := range []string{legacy.ForwardSnapshotFile, legacy.ForwardBackupFile} {
-		if err := os.WriteFile(filename, []byte(`{"version":1,"unknown":true}`), 0o600); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if _, err := newPlugin(args, zap.NewNop(), "legacy-corrupt"); err == nil {
-		t.Fatal("corrupt legacy snapshots were silently ignored")
-	}
-	if _, err := os.Stat(args.SnapshotFile); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("registry current exists after failed migration: %v", err)
-	}
-}
-
 func TestConcurrentUpdateWaitsForInFlightGroup(t *testing.T) {
 	started, release := make(chan struct{}), make(chan struct{})
 	var once sync.Once
@@ -632,7 +514,7 @@ func TestConcurrentUpdateWaitsForInFlightGroup(t *testing.T) {
 		t.Fatal("query did not reach old group")
 	}
 	nextServer := startDNSServer(t, "192.0.2.41", dns.RcodeSuccess, nil)
-	next := snapshot(2, group("new", "New", nextServer.addr))
+	next := snapshot(2, group("old", "Old", server.addr), group("new", "New", nextServer.addr))
 	next.ExpectedCurrentVersion = 1
 	if recorder := applySnapshot(t, p, next); recorder.Code != http.StatusOK {
 		t.Fatalf("update status=%d body=%s", recorder.Code, recorder.Body.String())
@@ -647,6 +529,7 @@ func TestConcurrentUpdateWaitsForInFlightGroup(t *testing.T) {
 		t.Fatal("old query did not complete")
 	}
 	qCtx := query("new.example.")
+	query_context.SetUpstreamGroupID(qCtx, "new")
 	if err := p.Exec(context.Background(), qCtx); err != nil {
 		t.Fatal(err)
 	}

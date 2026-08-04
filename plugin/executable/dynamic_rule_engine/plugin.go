@@ -264,17 +264,13 @@ func (p *Plugin) Exec(_ context.Context, qCtx *query_context.Context) error {
 	if result.Access.Action == ActionAllow {
 		qCtx.SetMark(p.marks.AccessAllow)
 	}
-	if result.Route.Action == ActionLocal {
-		qCtx.SetMark(p.marks.RouteLocal)
-		decision.RouteSource = "dynamic_rule"
-	}
-	if result.Route.Action == ActionRemote {
-		qCtx.SetMark(p.marks.RouteRemote)
-		decision.RouteSource = "dynamic_rule"
-	}
 	if result.Route.Action == ActionUpstream {
 		query_context.SetUpstreamGroupID(qCtx, result.Route.UpstreamGroupID)
-		decision.RouteSource = "subscription"
+		if result.Route.SourceID == 0 {
+			decision.RouteSource = "dynamic_rule"
+		} else {
+			decision.RouteSource = "subscription"
+		}
 	}
 	if result.Logging.Action == ActionNoLog {
 		qCtx.SetMark(p.marks.NoLog)

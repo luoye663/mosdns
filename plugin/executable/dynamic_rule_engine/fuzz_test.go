@@ -15,7 +15,7 @@ func FuzzNormalizeDomain(f *testing.F) {
 }
 
 func FuzzParseSnapshot(f *testing.F) {
-	f.Add([]byte(`{"schema_version":1,"version":1,"block_rcode":3,"rules":[]}`))
+	f.Add([]byte(`{"schema_version":4,"version":1,"block_rcode":3,"rules":[]}`))
 	f.Add([]byte(`{}`))
 	f.Fuzz(func(t *testing.T, input []byte) {
 		if len(input) > 1<<20 {

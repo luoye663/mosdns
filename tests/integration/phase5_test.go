@@ -28,15 +28,15 @@ func TestPhase5DNSRoutingAndAtomicPublishing(t *testing.T) {
 	if testing.Short() {
 		t.Skip("Phase 5 launches a real mosdns process")
 	}
-	local := newMockUpstream(t, netip.MustParseAddr("10.0.0.1"))
-	remote := newMockUpstream(t, netip.MustParseAddr("10.0.0.2"))
-	instance := startMosdns(t, local.addr, remote.addr)
+	groupA := newMockUpstream(t, netip.MustParseAddr("10.0.0.1"))
+	groupB := newMockUpstream(t, netip.MustParseAddr("10.0.0.2"))
+	instance := startMosdns(t, groupA.addr, groupB.addr)
 
-	// UDP 与 TCP 均必须走默认 remote 路由，并且第二次查询命中 remote 专属缓存。
+	// UDP 与 TCP 均走配置默认组，并且第二次查询命中该组的专属缓存。
 	assertAnswer(t, instance.query("udp", "cache.example"), "10.0.0.2")
 	assertAnswer(t, instance.query("tcp", "cache.example"), "10.0.0.2")
-	if got := remote.queries.Load(); got != 1 {
-		t.Fatalf("remote upstream queries = %d, want 1 after cache hit", got)
+	if got := groupB.queries.Load(); got != 1 {
+		t.Fatalf("default upstream queries = %d, want 1 after cache hit", got)
 	}
 
 	// 已缓存域名发布 block 后仍必须在进入 cache 前返回 NXDOMAIN。
@@ -44,42 +44,42 @@ func TestPhase5DNSRoutingAndAtomicPublishing(t *testing.T) {
 	if response := instance.query("udp", "cache.example"); response.Rcode != dns.RcodeNameError {
 		t.Fatalf("blocked cached response rcode = %s, want NXDOMAIN", dns.RcodeToString[response.Rcode])
 	}
-	if got := remote.queries.Load(); got != 1 {
-		t.Fatalf("block unexpectedly reached remote upstream: %d queries", got)
+	if got := groupB.queries.Load(); got != 1 {
+		t.Fatalf("block unexpectedly reached default upstream: %d queries", got)
 	}
 
-	// full allow 的优先级高于 domain block，只绕过 block，不强制变更默认 remote 路由。
+	// full allow 的优先级高于 domain block，只绕过 block，不强制变更默认组。
 	instance.apply(t, 2, 1, []rule{
 		{ID: 2, Category: "access", Action: "block", MatchType: "domain", Pattern: "cache.example"},
 		{ID: 3, Category: "access", Action: "allow", MatchType: "full", Pattern: "cache.example"},
 	})
 	assertAnswer(t, instance.query("udp", "cache.example"), "10.0.0.2")
 
-	// 强制 local/remote 分流命中不同 mock upstream，验证两个 route cache 的物理隔离。
+	// 任意组路由命中不同 mock upstream，验证两个组缓存的物理隔离。
 	instance.apply(t, 3, 2, []rule{
-		{ID: 4, Category: "route", Action: "local", MatchType: "full", Pattern: "force.local"},
-		{ID: 5, Category: "route", Action: "remote", MatchType: "full", Pattern: "force.remote"},
+		{ID: 4, Category: "route", Action: "upstream", UpstreamGroupID: "group_a", MatchType: "full", Pattern: "force.a"},
+		{ID: 5, Category: "route", Action: "upstream", UpstreamGroupID: "group_b", MatchType: "full", Pattern: "force.b"},
 	})
-	assertAnswer(t, instance.query("udp", "force.local"), "10.0.0.1")
-	assertAnswer(t, instance.query("udp", "force.remote"), "10.0.0.2")
-	if local.queries.Load() != 1 || remote.queries.Load() != 2 {
-		t.Fatalf("unexpected route counts local=%d remote=%d", local.queries.Load(), remote.queries.Load())
+	assertAnswer(t, instance.query("udp", "force.a"), "10.0.0.1")
+	assertAnswer(t, instance.query("udp", "force.b"), "10.0.0.2")
+	if groupA.queries.Load() != 1 || groupB.queries.Load() != 2 {
+		t.Fatalf("unexpected route counts group_a=%d group_b=%d", groupA.queries.Load(), groupB.queries.Load())
 	}
 
-	// 同一域名从 remote 改为 local 后，不能读取 remote cache 中的旧响应。
-	instance.apply(t, 4, 3, []rule{{ID: 6, Category: "route", Action: "remote", MatchType: "full", Pattern: "switch.example"}})
+	// 同一域名切换组后，不能读取前一个组缓存中的旧响应。
+	instance.apply(t, 4, 3, []rule{{ID: 6, Category: "route", Action: "upstream", UpstreamGroupID: "group_b", MatchType: "full", Pattern: "switch.example"}})
 	assertAnswer(t, instance.query("udp", "switch.example"), "10.0.0.2")
-	instance.apply(t, 5, 4, []rule{{ID: 7, Category: "route", Action: "local", MatchType: "full", Pattern: "switch.example"}})
+	instance.apply(t, 5, 4, []rule{{ID: 7, Category: "route", Action: "upstream", UpstreamGroupID: "group_a", MatchType: "full", Pattern: "switch.example"}})
 	assertAnswer(t, instance.query("udp", "switch.example"), "10.0.0.1")
 
-	// cache flush 只允许共享 token；flush 后默认 remote 查询会再次到达 upstream。
-	instance.flush(t, "cache_remote", "", http.StatusUnauthorized)
+	// cache flush 只允许共享 token；flush 后默认组查询会再次到达 upstream。
+	instance.flush(t, "group_b", "", http.StatusUnauthorized)
 	assertAnswer(t, instance.query("udp", "flush.example"), "10.0.0.2")
-	beforeFlush := remote.queries.Load()
-	instance.flush(t, "cache_remote", controlToken, http.StatusOK)
+	beforeFlush := groupB.queries.Load()
+	instance.flush(t, "group_b", controlToken, http.StatusOK)
 	assertAnswer(t, instance.query("udp", "flush.example"), "10.0.0.2")
-	if got := remote.queries.Load(); got != beforeFlush+1 {
-		t.Fatalf("remote cache flush did not force new upstream query: got %d want %d", got, beforeFlush+1)
+	if got := groupB.queries.Load(); got != beforeFlush+1 {
+		t.Fatalf("default cache flush did not force new upstream query: got %d want %d", got, beforeFlush+1)
 	}
 
 	// controller/query ingest 不可用时，审计 worker 的发送失败不能影响 DNS 或重建 DNS socket。
@@ -148,7 +148,7 @@ type mosdnsInstance struct {
 	client  *http.Client
 }
 
-func startMosdns(t *testing.T, localAddr, remoteAddr string) *mosdnsInstance {
+func startMosdns(t *testing.T, groupAAddr, groupBAddr string) *mosdnsInstance {
 	t.Helper()
 	mosdnsRoot := filepath.Clean(filepath.Join("..", ".."))
 	tempDir := t.TempDir()
@@ -190,54 +190,49 @@ plugins:
       include_answers: false
       include_error_text: true
       max_error_text_bytes: 64
-  - tag: cache_local
-    type: cache
+  - tag: dynamic_upstreams
+    type: dynamic_upstream_registry
     args:
-      size: 32
-      lazy_cache_ttl: 0
+      snapshot_file: %q
+      backup_file: %q
       auth_token_file: %q
-  - tag: cache_remote
-    type: cache
-    args:
-      size: 32
-      lazy_cache_ttl: 0
-      auth_token_file: %q
-  - tag: local_dns
-    type: forward
-    args:
-      upstreams:
-        - addr: "udp://%s"
-  - tag: remote_dns
-    type: forward
-    args:
-      upstreams:
-        - addr: "udp://%s"
-  - tag: route_local
-    type: sequence
-    args:
-      - exec: mark 1101
-      - exec: $cache_local
-      - matches:
-          - has_resp
-        exec: mark 2101
-      - matches:
-          - has_resp
-        exec: accept
-      - exec: $local_dns
-      - exec: accept
-  - tag: route_remote
-    type: sequence
-    args:
-      - exec: mark 1102
-      - exec: $cache_remote
-      - matches:
-          - has_resp
-        exec: mark 2101
-      - matches:
-          - has_resp
-        exec: accept
-      - exec: $remote_dns
-      - exec: accept
+      initial_snapshot:
+        schema_version: 1
+        version: 1
+        default_group_id: group_b
+        groups:
+          - id: group_a
+            name: Group A
+            enabled: true
+            mode: race
+            concurrent: 1
+            upstreams:
+              - tag: group_a_upstream
+                addr: "udp://%s"
+            ecs:
+              mode: off
+            cache:
+              enabled: true
+              size: 32
+          - id: group_b
+            name: Group B
+            enabled: true
+            mode: race
+            concurrent: 1
+            upstreams:
+              - tag: group_b_upstream
+                addr: "udp://%s"
+            ecs:
+              mode: off
+            cache:
+              enabled: true
+              size: 32
+        cache:
+          enabled: true
+          lazy_ttl: 0
+          negative:
+            enabled: true
+            ttl: 30
   - tag: main
     type: sequence
     args:
@@ -246,13 +241,8 @@ plugins:
       - matches:
           - mark 1001
         exec: reject 3
-      - matches:
-          - mark 1101
-        exec: goto route_local
-      - matches:
-          - mark 1102
-        exec: goto route_remote
-      - exec: goto route_remote
+      - exec: $dynamic_upstreams
+      - exec: accept
   - tag: udp_server
     type: udp_server
     args:
@@ -263,7 +253,7 @@ plugins:
     args:
       entry: main
       listen: "127.0.0.1:%d"
-`, apiPort, filepath.Join(tempDir, "current.json"), filepath.Join(tempDir, "backup.json"), tokenFile, tokenFile, tokenFile, tokenFile, localAddr, remoteAddr, dnsPort, dnsPort)
+`, apiPort, filepath.Join(tempDir, "rules-current.json"), filepath.Join(tempDir, "rules-backup.json"), tokenFile, tokenFile, filepath.Join(tempDir, "registry-current.json"), filepath.Join(tempDir, "registry-backup.json"), tokenFile, groupAAddr, groupBAddr, dnsPort, dnsPort)
 	if err := os.WriteFile(configPath, []byte(config), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -326,7 +316,7 @@ func (m *mosdnsInstance) queryResult(network, name string) (*dns.Msg, error) {
 
 func (m *mosdnsInstance) apply(t *testing.T, version, expected uint64, rules []rule) {
 	t.Helper()
-	payload := snapshot{SchemaVersion: 1, Version: version, ExpectedCurrentVersion: expected, GeneratedAt: time.Now().UTC(), BlockRCode: dns.RcodeNameError, Rules: rules}
+	payload := snapshot{SchemaVersion: 4, Version: version, ExpectedCurrentVersion: expected, GeneratedAt: time.Now().UTC(), BlockRCode: dns.RcodeNameError, Rules: rules}
 	body, err := json.Marshal(payload)
 	if err != nil {
 		t.Fatal(err)
@@ -350,7 +340,8 @@ func (m *mosdnsInstance) apply(t *testing.T, version, expected uint64, rules []r
 
 func (m *mosdnsInstance) flush(t *testing.T, tag, token string, wantStatus int) {
 	t.Helper()
-	request, err := http.NewRequest(http.MethodGet, m.apiURL+"/plugins/"+tag+"/flush", nil)
+	body := bytes.NewBufferString(fmt.Sprintf(`{"group_id":%q,"expected_current_version":1}`, tag))
+	request, err := http.NewRequest(http.MethodPost, m.apiURL+"/plugins/dynamic_upstreams/flush", body)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -377,14 +368,15 @@ type snapshot struct {
 }
 
 type rule struct {
-	ID        int64  `json:"id"`
-	Category  string `json:"category"`
-	Action    string `json:"action"`
-	MatchType string `json:"match_type"`
-	Pattern   string `json:"pattern"`
-	Priority  int    `json:"priority"`
-	Source    string `json:"source"`
-	Comment   string `json:"comment"`
+	ID              int64  `json:"id"`
+	Category        string `json:"category"`
+	Action          string `json:"action"`
+	UpstreamGroupID string `json:"upstream_group_id,omitempty"`
+	MatchType       string `json:"match_type"`
+	Pattern         string `json:"pattern"`
+	Priority        int    `json:"priority"`
+	Source          string `json:"source"`
+	Comment         string `json:"comment"`
 }
 
 func unusedTCPPort(t *testing.T) int {

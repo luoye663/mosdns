@@ -29,36 +29,25 @@ import (
 )
 
 const (
-	PluginType             = "dynamic_upstream_registry"
-	defaultCacheSize       = 1024
-	maximumCacheEntries    = 65536
-	maximumBodyBytes       = 4 << 20
-	routeLocalMark         = 1101
-	routeRemoteMark        = 1102
-	subscriptionLocalMark  = 1301
-	subscriptionRemoteMark = 1302
+	PluginType            = "dynamic_upstream_registry"
+	registrySchemaVersion = 1
+	defaultCacheSize      = 1024
+	maximumCacheEntries   = 65536
+	maximumBodyBytes      = 4 << 20
 )
 
 var groupIDPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,63}$`)
 
 type Args struct {
-	AuthTokenFile   string        `yaml:"auth_token_file"`
-	SnapshotFile    string        `yaml:"snapshot_file"`
-	BackupFile      string        `yaml:"backup_file"`
-	CacheDumpDir    string        `yaml:"cache_dump_dir"`
-	InitialSnapshot Snapshot      `yaml:"initial_snapshot"`
-	LegacyGroups    []LegacyGroup `yaml:"legacy_groups"`
-}
-
-type LegacyGroup struct {
-	ID                  string `yaml:"id"`
-	ForwardSnapshotFile string `yaml:"forward_snapshot_file"`
-	ForwardBackupFile   string `yaml:"forward_backup_file"`
-	ECSSnapshotFile     string `yaml:"ecs_snapshot_file"`
-	ECSBackupFile       string `yaml:"ecs_backup_file"`
+	AuthTokenFile   string   `yaml:"auth_token_file"`
+	SnapshotFile    string   `yaml:"snapshot_file"`
+	BackupFile      string   `yaml:"backup_file"`
+	CacheDumpDir    string   `yaml:"cache_dump_dir"`
+	InitialSnapshot Snapshot `yaml:"initial_snapshot"`
 }
 
 type Snapshot struct {
+	SchemaVersion          uint32            `json:"schema_version" yaml:"schema_version"`
 	Version                uint64            `json:"version" yaml:"version"`
 	ExpectedCurrentVersion uint64            `json:"expected_current_version" yaml:"expected_current_version"`
 	DefaultGroupID         string            `json:"default_group_id" yaml:"default_group_id"`
@@ -189,10 +178,6 @@ func newPlugin(args Args, logger *zap.Logger, metricsTag string) (*Plugin, error
 	}
 	if source == "" {
 		snapshot = args.InitialSnapshot
-		snapshot, err = migrateLegacyGroups(snapshot, args.LegacyGroups)
-		if err != nil {
-			return nil, fmt.Errorf("migrate legacy groups: %w", err)
-		}
 	}
 	state, err := p.buildState(snapshot, true)
 	if err != nil {
@@ -282,20 +267,11 @@ func (p *Plugin) Exec(ctx context.Context, qCtx *query_context.Context) error {
 	}
 	defer p.release(state)
 	groupID, source := state.snapshot.DefaultGroupID, "default"
-	if decision, ok := dynamic_rule_engine.RuntimeDecisionFromContext(qCtx); ok && decision.RouteAction == dynamic_rule_engine.ActionLocal {
-		groupID, source = "local_dns", "dynamic_rule"
-	} else if decision, ok := dynamic_rule_engine.RuntimeDecisionFromContext(qCtx); ok && decision.RouteAction == dynamic_rule_engine.ActionRemote {
-		groupID, source = "remote_dns", "dynamic_rule"
-	} else if explicit, ok := query_context.UpstreamGroupID(qCtx); ok {
+	if explicit, ok := query_context.UpstreamGroupID(qCtx); ok {
 		groupID, source = explicit, "subscription"
-	} else if qCtx.HasMark(subscriptionLocalMark) {
-		groupID, source = "local_dns", "subscription"
-	} else if qCtx.HasMark(subscriptionRemoteMark) {
-		groupID, source = "remote_dns", "subscription"
-	} else if qCtx.HasMark(routeLocalMark) {
-		groupID, source = "local_dns", "dynamic_rule"
-	} else if qCtx.HasMark(routeRemoteMark) {
-		groupID, source = "remote_dns", "dynamic_rule"
+		if decision, ok := dynamic_rule_engine.RuntimeDecisionFromContext(qCtx); ok && decision.RouteSource != "" {
+			source = decision.RouteSource
+		}
 	}
 	group := state.groups[groupID]
 	meta := query_context.UpstreamRuntimeMeta{GroupID: groupID, RouteSource: source}

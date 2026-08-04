@@ -23,7 +23,7 @@ func canonicalSnapshot(snapshot Snapshot, limits Limits) (Snapshot, *CompiledSna
 		}
 		rules = append(rules, normalized)
 	}
-	sets, err := normalizeSubscriptionSets(snapshot.SubscriptionSets, snapshot.SchemaVersion, normalizeLimits(limits))
+	sets, err := normalizeSubscriptionSets(snapshot.SubscriptionSets, normalizeLimits(limits))
 	if err != nil {
 		return Snapshot{}, nil, err
 	}

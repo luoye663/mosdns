@@ -95,7 +95,7 @@ func execRuleSnapshot(t *testing.T, snapshot dynamic_rule_engine.Snapshot, qCtx 
 }
 
 func auditMarksWithoutLegacySubscriptions() Marks {
-	return Marks{AccessBlock: 1001, RouteLocal: 1101, RouteRemote: 1102, NoLog: 1201, CacheHit: 2101}
+	return Marks{AccessBlock: 1001, NoLog: 1201, CacheHit: 2101}
 }
 
 func TestExecObservesRejectAndCacheMark(t *testing.T) {
@@ -162,7 +162,7 @@ func TestExecObservesGotoAndAccept(t *testing.T) {
 	}
 	select {
 	case event := <-events:
-		if event.QName != "goto.example" || event.RCode != dns.RcodeSuccess || event.Route != "remote" {
+		if event.QName != "goto.example" || event.RCode != dns.RcodeSuccess || event.Route != "forward" || event.SchemaVersion != 2 {
 			t.Fatalf("goto/accept event = %+v", event)
 		}
 	case <-time.After(time.Second):
@@ -208,28 +208,12 @@ func TestBuildEventOmitsMinimumTTLWithoutAnswer(t *testing.T) {
 	}
 }
 
-func TestRouteMarksFromFinalSequenceUseDefaultSource(t *testing.T) {
+func TestRouteDefaultsToForward(t *testing.T) {
 	p := newTestAuditPlugin(t, "http://127.0.0.1:1", 1, 1)
 	defer p.Close()
-
-	for _, test := range []struct {
-		name       string
-		mark       uint32
-		wantRoute  string
-		wantSource string
-		wantGroup  string
-	}{
-		{name: "remote", mark: p.marks.RouteRemote, wantRoute: "remote", wantSource: "default", wantGroup: "remote_dns"},
-		{name: "local", mark: p.marks.RouteLocal, wantRoute: "local", wantSource: "default", wantGroup: "local_dns"},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			qCtx := testContext(test.name + ".example")
-			qCtx.SetMark(test.mark)
-			route, source, group := p.route(qCtx)
-			if route != test.wantRoute || source != test.wantSource || group != test.wantGroup {
-				t.Fatalf("route() = (%q, %q, %q), want (%q, %q, %q)", route, source, group, test.wantRoute, test.wantSource, test.wantGroup)
-			}
-		})
+	route, source, group := p.route(testContext("default.example"))
+	if route != "forward" || source != "default" || group != "" {
+		t.Fatalf("route() = (%q, %q, %q)", route, source, group)
 	}
 }
 
@@ -378,29 +362,20 @@ func TestAccessAndRouteSubscriptionsAuditBothCategories(t *testing.T) {
 	}
 }
 
-func TestLegacySubscriptionMarksRemainOptionalAndCompatible(t *testing.T) {
-	dir := t.TempDir()
-	tokenFile := filepath.Join(dir, "token")
-	if err := os.WriteFile(tokenFile, []byte("token"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	args := Args{Endpoint: "http://127.0.0.1:1", AuthTokenFile: tokenFile, Marks: auditMarksWithoutLegacySubscriptions()}
-	p, err := newPlugin(args)
-	if err != nil {
-		t.Fatalf("optional legacy marks rejected: %v", err)
-	}
+func TestBlockedAccessSubscriptionDoesNotAttributeUnusedRoute(t *testing.T) {
+	qCtx := testContext("blocked.audit.example")
+	execRuleSnapshot(t, dynamic_rule_engine.Snapshot{
+		SchemaVersion: dynamic_rule_engine.SchemaVersion, Version: 1, BlockRCode: dns.RcodeNameError, Rules: []dynamic_rule_engine.Rule{},
+		SubscriptionSets: []dynamic_rule_engine.SubscriptionSet{
+			{SourceID: 21, SourceName: "access-source", Category: dynamic_rule_engine.CategoryAccess, Action: dynamic_rule_engine.ActionBlock, Priority: 10, Domains: []string{"audit.example"}},
+			{SourceID: 22, SourceName: "route-source", BindingID: 31, UpstreamGroupID: "unused_group", Category: dynamic_rule_engine.CategoryRoute, Action: dynamic_rule_engine.ActionUpstream, Priority: 10, Domains: []string{"audit.example"}},
+		},
+	}, qCtx)
+	p := newTestAuditPlugin(t, "http://127.0.0.1:1", 1, 1)
 	defer p.Close()
-	if event := p.buildEvent(testContext("zero-marks.example"), time.Now(), nil); len(event.SubscriptionCategories) != 0 {
-		t.Fatalf("zero legacy marks produced categories: %+v", event.SubscriptionCategories)
-	}
-
-	p.marks.SubscriptionBlock = 1303
-	qCtx := testContext("legacy-block.example")
-	qCtx.SetMark(p.marks.AccessBlock)
-	qCtx.SetMark(p.marks.SubscriptionBlock)
 	event := p.buildEvent(qCtx, time.Now(), nil)
-	if event.RouteSource != "subscription" || len(event.SubscriptionCategories) != 1 || event.SubscriptionCategories[0] != "block" {
-		t.Fatalf("legacy mark audit event = %+v", event)
+	if event.Route != "block" || event.SubscriptionSourceID != 21 || event.SubscriptionSourceName != "access-source" || event.SubscriptionBindingID != 0 || len(event.SubscriptionCategories) != 1 || event.SubscriptionCategories[0] != "access" {
+		t.Fatalf("blocked subscription audit event = %+v", event)
 	}
 }
 

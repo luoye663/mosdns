@@ -3,7 +3,7 @@ package dynamic_rule_engine
 import "time"
 
 const (
-	SchemaVersion = 3
+	SchemaVersion = 4
 
 	CategoryAccess  = "access"
 	CategoryRoute   = "route"
@@ -11,8 +11,6 @@ const (
 
 	ActionAllow    = "allow"
 	ActionBlock    = "block"
-	ActionLocal    = "local"
-	ActionRemote   = "remote"
 	ActionUpstream = "upstream"
 	ActionNoLog    = "no_log"
 
@@ -68,14 +66,15 @@ type SubscriptionSet struct {
 
 // Rule 保留发布快照中需要审计和确定性排序的全部字段。
 type Rule struct {
-	ID        int64  `json:"id"`
-	Category  string `json:"category"`
-	Action    string `json:"action"`
-	MatchType string `json:"match_type"`
-	Pattern   string `json:"pattern"`
-	Priority  int    `json:"priority"`
-	Source    string `json:"source"`
-	Comment   string `json:"comment"`
+	ID              int64  `json:"id"`
+	Category        string `json:"category"`
+	Action          string `json:"action"`
+	UpstreamGroupID string `json:"upstream_group_id,omitempty"`
+	MatchType       string `json:"match_type"`
+	Pattern         string `json:"pattern"`
+	Priority        int    `json:"priority"`
+	Source          string `json:"source"`
+	Comment         string `json:"comment"`
 }
 
 // MatchedRule 是请求匹配结果中可安全传递到后续审计阶段的不可变值。

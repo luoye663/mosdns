@@ -10,8 +10,8 @@ import (
 )
 
 func canonicalSnapshotValues(snapshot Snapshot) (Snapshot, error) {
-	if !groupIDPattern.MatchString(snapshot.DefaultGroupID) {
-		return Snapshot{}, errors.New("default_group_id is invalid")
+	if snapshot.SchemaVersion != registrySchemaVersion {
+		return Snapshot{}, fmt.Errorf("schema_version must be %d", registrySchemaVersion)
 	}
 	if len(snapshot.Groups) < 1 || len(snapshot.Groups) > 32 {
 		return Snapshot{}, errors.New("groups must contain 1..32 entries")
@@ -24,6 +24,10 @@ func canonicalSnapshotValues(snapshot Snapshot) (Snapshot, error) {
 	}
 	if snapshot.Cache.Negative.TTL > 86400 {
 		return Snapshot{}, errors.New("cache.negative.ttl must be within 1..86400")
+	}
+	snapshot.DefaultGroupID = strings.TrimSpace(snapshot.DefaultGroupID)
+	if !groupIDPattern.MatchString(snapshot.DefaultGroupID) {
+		return Snapshot{}, errors.New("default_group_id is invalid")
 	}
 	seen := make(map[string]struct{}, len(snapshot.Groups))
 	totalCacheSize, defaultEnabled := 0, false

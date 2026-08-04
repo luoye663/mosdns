@@ -71,7 +71,7 @@ type UpstreamRuntimeMeta struct {
 }
 
 // SetUpstreamGroupID reserves an explicit group selection for later runtime
-// binding (for example, by subscription matching). It takes priority over marks.
+// binding by a dynamic rule or route subscription.
 func SetUpstreamGroupID(ctx *Context, groupID string) {
 	ctx.StoreValue(requestedUpstreamGroupKey, groupID)
 }

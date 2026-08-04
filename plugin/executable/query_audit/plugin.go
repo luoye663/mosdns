@@ -31,7 +31,7 @@ import (
 
 const (
 	PluginType            = "query_audit"
-	eventSchemaVersion    = 1
+	eventSchemaVersion    = 2
 	shutdownFlushLimit    = 2 * time.Second
 	maxAnswerIPs          = 16
 	maxAnswerRecords      = 32
@@ -43,15 +43,9 @@ var Version = "dev"
 
 // Marks 统一定义审计读取的 marks，启动时会检查彼此不冲突。
 type Marks struct {
-	AccessBlock        uint32 `yaml:"access_block"`
-	RouteLocal         uint32 `yaml:"route_local"`
-	RouteRemote        uint32 `yaml:"route_remote"`
-	NoLog              uint32 `yaml:"no_log"`
-	SubscriptionLocal  uint32 `yaml:"subscription_local"`
-	SubscriptionRemote uint32 `yaml:"subscription_remote"`
-	SubscriptionBlock  uint32 `yaml:"subscription_block"`
-	SubscriptionAllow  uint32 `yaml:"subscription_allow"`
-	CacheHit           uint32 `yaml:"cache_hit"`
+	AccessBlock uint32 `yaml:"access_block"`
+	NoLog       uint32 `yaml:"no_log"`
+	CacheHit    uint32 `yaml:"cache_hit"`
 }
 
 // Args 是 query_audit 的 YAML 配置；启用 include_answers 时携带受限的 Answer 区诊断数据。
@@ -234,7 +228,7 @@ func validateArgs(args *Args) error {
 		args.MaxErrorTextBytes = 256
 	}
 	if args.Marks == (Marks{}) {
-		args.Marks = Marks{AccessBlock: 1001, RouteLocal: 1101, RouteRemote: 1102, NoLog: 1201, SubscriptionLocal: 1301, SubscriptionRemote: 1302, SubscriptionBlock: 1303, SubscriptionAllow: 1304, CacheHit: 2101}
+		args.Marks = Marks{AccessBlock: 1001, NoLog: 1201, CacheHit: 2101}
 	}
 	if args.QueueSize < 1 || args.BatchSize < 1 {
 		return fmt.Errorf("queue_size and batch_size must be greater than zero")
@@ -252,19 +246,10 @@ func validateArgs(args *Args) error {
 		return fmt.Errorf("request_timeout must be a positive duration")
 	}
 	seen := map[uint32]string{}
-	requiredMarks := map[string]uint32{"access_block": args.Marks.AccessBlock, "route_local": args.Marks.RouteLocal, "route_remote": args.Marks.RouteRemote, "no_log": args.Marks.NoLog, "cache_hit": args.Marks.CacheHit}
+	requiredMarks := map[string]uint32{"access_block": args.Marks.AccessBlock, "no_log": args.Marks.NoLog, "cache_hit": args.Marks.CacheHit}
 	for name, value := range requiredMarks {
 		if value == 0 {
 			return fmt.Errorf("marks.%s must be greater than zero", name)
-		}
-		if previous, ok := seen[value]; ok {
-			return fmt.Errorf("marks.%s duplicates marks.%s", name, previous)
-		}
-		seen[value] = name
-	}
-	for name, value := range map[string]uint32{"subscription_local": args.Marks.SubscriptionLocal, "subscription_remote": args.Marks.SubscriptionRemote, "subscription_block": args.Marks.SubscriptionBlock, "subscription_allow": args.Marks.SubscriptionAllow} {
-		if value == 0 {
-			continue
 		}
 		if previous, ok := seen[value]; ok {
 			return fmt.Errorf("marks.%s duplicates marks.%s", name, previous)
@@ -304,13 +289,7 @@ func (p *Plugin) buildEvent(qCtx *query_context.Context, started time.Time, exec
 	cacheHit := qCtx.HasMark(p.marks.CacheHit)
 	if metadata, ok := query_context.UpstreamRuntimeMetaFromContext(qCtx); ok {
 		routeSource, upstream, upstreamTag, cacheHit = metadata.RouteSource, metadata.GroupID, metadata.UpstreamTag, metadata.CacheHit
-		if metadata.GroupID == "local_dns" {
-			route = "local"
-		} else if metadata.GroupID == "remote_dns" {
-			route = "remote"
-		} else {
-			route = "forward"
-		}
+		route = "forward"
 	}
 	event := &QueryEvent{
 		SchemaVersion: eventSchemaVersion, EventID: p.newEventID(), TimestampUnixMS: time.Now().UnixMilli(), ProcessStartedAtUnixMS: p.processStarted.UnixMilli(),
@@ -318,21 +297,13 @@ func (p *Plugin) buildEvent(qCtx *query_context.Context, started time.Time, exec
 		RCode: rcode, Route: route, RouteSource: routeSource, UpstreamGroup: upstream, UpstreamTag: upstreamTag, CacheHit: cacheHit,
 		AnswerCount: answerCount, LatencyUS: time.Since(started).Microseconds(),
 	}
-	for _, category := range []struct {
-		mark uint32
-		name string
-	}{{p.marks.SubscriptionAllow, "allow"}, {p.marks.SubscriptionBlock, "block"}, {p.marks.SubscriptionLocal, "local"}, {p.marks.SubscriptionRemote, "remote"}} {
-		if category.mark != 0 && qCtx.HasMark(category.mark) {
-			event.SubscriptionCategories = appendUnique(event.SubscriptionCategories, category.name)
-		}
-	}
 	if decision, ok := dynamic_rule_engine.RuntimeDecisionFromContext(qCtx); ok {
 		event.SnapshotVersion, event.AccessRuleID, event.RouteRuleID = decision.SnapshotVersion, decision.AccessRuleID, decision.RouteRuleID
 		if decision.AccessSubscriptionSourceID != 0 {
 			event.SubscriptionSourceID, event.SubscriptionSourceName = decision.AccessSubscriptionSourceID, decision.AccessSubscriptionSourceName
 			event.SubscriptionCategories = appendUnique(event.SubscriptionCategories, dynamic_rule_engine.CategoryAccess)
 		}
-		if decision.RouteSubscriptionSourceID != 0 {
+		if event.Route == "forward" && decision.RouteSubscriptionSourceID != 0 {
 			event.SubscriptionSourceID, event.SubscriptionSourceName = decision.RouteSubscriptionSourceID, decision.RouteSubscriptionSourceName
 			event.SubscriptionBindingID = decision.RouteSubscriptionBindingID
 			event.SubscriptionCategories = appendUnique(event.SubscriptionCategories, dynamic_rule_engine.CategoryRoute)
@@ -417,34 +388,17 @@ func (p *Plugin) route(qCtx *query_context.Context) (route, source, upstream str
 		if decision, ok := dynamic_rule_engine.RuntimeDecisionFromContext(qCtx); ok && decision.AccessSubscriptionSourceID != 0 && decision.AccessSubscriptionAction == dynamic_rule_engine.ActionBlock {
 			return "block", "subscription", ""
 		}
-		if p.marks.SubscriptionBlock != 0 && qCtx.HasMark(p.marks.SubscriptionBlock) {
-			return "block", "subscription", ""
-		}
 		return "block", "dynamic_rule", ""
 	}
-	dynamicSource := false
 	if decision, ok := dynamic_rule_engine.RuntimeDecisionFromContext(qCtx); ok {
-		dynamicSource = decision.RouteSource == "dynamic_rule"
+		if decision.RouteSource != "" {
+			return "forward", decision.RouteSource, decision.UpstreamGroupID
+		}
 	}
-	if qCtx.HasMark(p.marks.RouteLocal) {
-		if p.marks.SubscriptionLocal != 0 && qCtx.HasMark(p.marks.SubscriptionLocal) {
-			return "local", "subscription", "local_dns"
-		}
-		if dynamicSource {
-			return "local", "dynamic_rule", "local_dns"
-		}
-		return "local", "default", "local_dns"
+	if groupID, ok := query_context.UpstreamGroupID(qCtx); ok {
+		return "forward", "subscription", groupID
 	}
-	if qCtx.HasMark(p.marks.RouteRemote) {
-		if p.marks.SubscriptionRemote != 0 && qCtx.HasMark(p.marks.SubscriptionRemote) {
-			return "remote", "subscription", "remote_dns"
-		}
-		if dynamicSource {
-			return "remote", "dynamic_rule", "remote_dns"
-		}
-		return "remote", "default", "remote_dns"
-	}
-	return "remote", "default", "remote_dns"
+	return "forward", "default", ""
 }
 
 func appendUnique(values []string, value string) []string {

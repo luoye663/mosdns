@@ -54,7 +54,7 @@ func (s *CompiledSnapshot) LoadedAt() time.Time   { return s.loadedAt }
 // Compile 在 DNS 请求路径外执行全部校验和索引构建。
 func Compile(snapshot Snapshot, limits Limits) (*CompiledSnapshot, error) {
 	limits = normalizeLimits(limits)
-	if snapshot.SchemaVersion < 1 || snapshot.SchemaVersion > SchemaVersion {
+	if snapshot.SchemaVersion != SchemaVersion {
 		return nil, fmt.Errorf("schema_version %d is unsupported", snapshot.SchemaVersion)
 	}
 	if snapshot.Version == 0 {
@@ -90,14 +90,9 @@ func Compile(snapshot Snapshot, limits Limits) (*CompiledSnapshot, error) {
 	if err := validateRouteConflicts(normalizedRules); err != nil {
 		return nil, err
 	}
-	normalizedSets, err := normalizeSubscriptionSets(snapshot.SubscriptionSets, snapshot.SchemaVersion, limits)
+	normalizedSets, err := normalizeSubscriptionSets(snapshot.SubscriptionSets, limits)
 	if err != nil {
 		return nil, err
-	}
-	if snapshot.SchemaVersion < SchemaVersion {
-		if err := validateSubscriptionRouteConflicts(normalizedRules, normalizedSets); err != nil {
-			return nil, err
-		}
 	}
 
 	checksum, canonicalRules, err := checksumSnapshot(snapshot, normalizedRules, normalizedSets)
@@ -134,7 +129,7 @@ func Compile(snapshot Snapshot, limits Limits) (*CompiledSnapshot, error) {
 	return compiled, nil
 }
 
-func normalizeSubscriptionSets(sets []SubscriptionSet, schemaVersion uint32, limits Limits) ([]SubscriptionSet, error) {
+func normalizeSubscriptionSets(sets []SubscriptionSet, limits Limits) ([]SubscriptionSet, error) {
 	result := make([]SubscriptionSet, len(sets))
 	seenSources := make(map[int64]struct{}, len(sets))
 	seenBindings := make(map[int64]struct{}, len(sets))
@@ -151,10 +146,10 @@ func normalizeSubscriptionSets(sets []SubscriptionSet, schemaVersion uint32, lim
 		}
 		category, ok := categoryIndex(set.Category)
 		validSubscriptionAction := validAction(set.Category, set.Action)
-		if schemaVersion == SchemaVersion && set.Category == CategoryRoute {
+		if set.Category == CategoryRoute {
 			validSubscriptionAction = set.Action == ActionUpstream && set.BindingID > 0 && validUpstreamGroupID(set.UpstreamGroupID)
 		}
-		if (schemaVersion != SchemaVersion || set.Category != CategoryRoute) && (set.BindingID != 0 || set.UpstreamGroupID != "") {
+		if set.Category != CategoryRoute && (set.BindingID != 0 || set.UpstreamGroupID != "") {
 			validSubscriptionAction = false
 		}
 		if !ok || category < 0 || !validSubscriptionAction || set.SourceID <= 0 || set.SourceName == "" || set.Priority < 0 || set.Priority > 1000 || len(set.Domains) == 0 {
@@ -185,7 +180,7 @@ func (s *CompiledSnapshot) addSubscriptionSets(sets []SubscriptionSet, limits Li
 	for _, set := range sets {
 		category, _ := categoryIndex(set.Category)
 		match := MatchedRule{RuleID: set.SourceID, Action: set.Action, MatchType: MatchTypeDomain, Priority: set.Priority, SourceID: set.SourceID, SourceName: set.SourceName, BindingID: set.BindingID, UpstreamGroupID: set.UpstreamGroupID}
-		if s.schemaVersion == SchemaVersion && category == categoryRoute {
+		if category == categoryRoute {
 			for _, domain := range set.Domains {
 				match.Pattern = domain
 				s.routeBindings[domain] = preferredBinding(match, s.routeBindings[domain])
@@ -204,33 +199,11 @@ func subscriptionDomainCount(sets []SubscriptionSet) int {
 	return total
 }
 
-func validateSubscriptionRouteConflicts(rules []Rule, sets []SubscriptionSet) error {
-	seen := map[string]string{}
-	for _, rule := range rules {
-		if rule.Category == CategoryRoute && rule.MatchType == MatchTypeDomain {
-			seen[rule.Pattern+"\x00"+fmt.Sprint(rule.Priority)] = rule.Action
-		}
-	}
-	for _, set := range sets {
-		if set.Category != CategoryRoute {
-			continue
-		}
-		for _, domain := range set.Domains {
-			key := domain + "\x00" + fmt.Sprint(set.Priority)
-			if action, exists := seen[key]; exists && action != set.Action {
-				return fmt.Errorf("route conflict for subscription domain %q", domain)
-			}
-			seen[key] = set.Action
-		}
-	}
-	return nil
-}
-
 func (s *CompiledSnapshot) addRule(rule Rule) error {
 	category, _ := categoryIndex(rule.Category)
 	match := MatchedRule{
 		RuleID: rule.ID, Action: rule.Action, MatchType: rule.MatchType,
-		Pattern: rule.Pattern, Priority: rule.Priority,
+		Pattern: rule.Pattern, Priority: rule.Priority, UpstreamGroupID: rule.UpstreamGroupID,
 	}
 	switch rule.MatchType {
 	case MatchTypeFull:
@@ -260,16 +233,13 @@ func (s *CompiledSnapshot) Match(qname string) (MatchResult, error) {
 }
 
 func (s *CompiledSnapshot) matchCategory(qname string, category int) MatchedRule {
-	if match, ok := s.full[category][qname]; ok {
-		return match
-	}
 	var best MatchedRule
-	// A flat suffix table avoids one map allocation per domain label while
-	// retaining the deepest-domain-first matching semantics of the old trie.
+	if match, ok := s.full[category][qname]; ok {
+		best = preferred(match, best, category)
+	}
 	for suffix := qname; suffix != ""; {
 		if match, ok := s.domain[category][suffix]; ok {
-			best = match
-			break
+			best = preferred(match, best, category)
 		}
 		separator := strings.IndexByte(suffix, '.')
 		if separator < 0 {
@@ -277,40 +247,29 @@ func (s *CompiledSnapshot) matchCategory(qname string, category int) MatchedRule
 		}
 		suffix = suffix[separator+1:]
 	}
-	if s.schemaVersion == SchemaVersion && category == categoryRoute {
-		if best.Matched() {
-			return best
-		}
-		for _, rule := range s.regex {
-			if rule.category == category && rule.re.MatchString(qname) {
-				best = preferred(rule.match, best, category)
+	if category != categoryRoute {
+		for _, set := range s.subscriptions[category] {
+			if subscriptionMatches(set.domains, qname) {
+				best = preferred(set.match, best, category)
 			}
 		}
-		if best.Matched() {
-			return best
-		}
-		return s.matchRouteBinding(qname)
-	}
-	for _, set := range s.subscriptions[category] {
-		if subscriptionMatches(set.domains, qname) {
-			best = preferred(set.match, best, category)
-		}
-	}
-	if best.Matched() {
-		return best
 	}
 	for _, rule := range s.regex {
 		if rule.category == category && rule.re.MatchString(qname) {
 			best = preferred(rule.match, best, category)
 		}
 	}
+	if !best.Matched() && category == categoryRoute {
+		return s.matchRouteBinding(qname)
+	}
 	return best
 }
 
 func (s *CompiledSnapshot) matchRouteBinding(qname string) MatchedRule {
+	var best MatchedRule
 	for suffix := qname; suffix != ""; {
 		if match, ok := s.routeBindings[suffix]; ok {
-			return match
+			best = preferredBinding(match, best)
 		}
 		separator := strings.IndexByte(suffix, '.')
 		if separator < 0 {
@@ -318,7 +277,7 @@ func (s *CompiledSnapshot) matchRouteBinding(qname string) MatchedRule {
 		}
 		suffix = suffix[separator+1:]
 	}
-	return MatchedRule{}
+	return best
 }
 
 func subscriptionMatches(domains []string, qname string) bool {
@@ -365,6 +324,13 @@ func normalizeRule(rule Rule, limits Limits) (Rule, bool, error) {
 	}
 	if !validAction(rule.Category, rule.Action) {
 		return Rule{}, false, fmt.Errorf("action %q is invalid for category %q", rule.Action, rule.Category)
+	}
+	if rule.Category == CategoryRoute {
+		if rule.Action != ActionUpstream || !validUpstreamGroupID(rule.UpstreamGroupID) {
+			return Rule{}, false, fmt.Errorf("route rule requires action upstream and a valid upstream_group_id")
+		}
+	} else if rule.UpstreamGroupID != "" {
+		return Rule{}, false, fmt.Errorf("upstream_group_id is only valid for route rules")
 	}
 	if rule.Priority < 0 || rule.Priority > 1000 {
 		return Rule{}, false, fmt.Errorf("priority %d is outside 0..1000", rule.Priority)
@@ -421,7 +387,7 @@ func validAction(category, action string) bool {
 	case CategoryAccess:
 		return action == ActionAllow || action == ActionBlock
 	case CategoryRoute:
-		return action == ActionLocal || action == ActionRemote
+		return action == ActionUpstream
 	case CategoryLogging:
 		return action == ActionNoLog
 	default:
@@ -444,10 +410,10 @@ func preferredBinding(candidate, current MatchedRule) MatchedRule {
 
 // preferred 按 priority 和规格定义的同级语义选择唯一且确定的记录。
 func preferred(candidate, current MatchedRule, category int) MatchedRule {
-	if !current.Matched() || candidate.Priority > current.Priority {
+	if !current.Matched() || candidate.Priority < current.Priority {
 		return candidate
 	}
-	if candidate.Priority < current.Priority {
+	if candidate.Priority > current.Priority {
 		return current
 	}
 	if category == categoryAccess && candidate.Action == ActionAllow && current.Action == ActionBlock {
@@ -470,10 +436,11 @@ func validateRouteConflicts(rules []Rule) error {
 			continue
 		}
 		key := strings.Join([]string{rule.MatchType, rule.Pattern, fmt.Sprint(rule.Priority)}, "\x00")
-		if action, ok := seen[key]; ok && action != rule.Action {
+		effect := rule.Action + "\x00" + rule.UpstreamGroupID
+		if action, ok := seen[key]; ok && action != effect {
 			return fmt.Errorf("route conflict for %s pattern %q at priority %d", rule.MatchType, rule.Pattern, rule.Priority)
 		}
-		seen[key] = rule.Action
+		seen[key] = effect
 	}
 	return nil
 }
@@ -493,28 +460,20 @@ func checksumSnapshot(snapshot Snapshot, rules []Rule, sets []SubscriptionSet) (
 			return a.Pattern < b.Pattern
 		}
 		if a.Priority != b.Priority {
-			return a.Priority > b.Priority
+			return a.Priority < b.Priority
 		}
 		return a.ID < b.ID
 	})
-	var canonical any
-	if snapshot.SchemaVersion == SchemaVersion {
-		canonicalSets := make([]canonicalSubscriptionSetV3, len(sets))
-		for i, set := range sets {
-			canonicalSets[i] = canonicalSubscriptionSetV3{
-				SourceID: set.SourceID, SourceName: set.SourceName, Category: set.Category, Action: set.Action,
-				BindingID: set.BindingID, UpstreamGroupID: set.UpstreamGroupID, Priority: set.Priority, Domains: set.Domains,
-			}
+	canonicalSets := make([]canonicalSubscriptionSetV4, len(sets))
+	for i, set := range sets {
+		canonicalSets[i] = canonicalSubscriptionSetV4{
+			SourceID: set.SourceID, SourceName: set.SourceName, Category: set.Category, Action: set.Action,
+			BindingID: set.BindingID, UpstreamGroupID: set.UpstreamGroupID, Priority: set.Priority, Domains: set.Domains,
 		}
-		canonical = canonicalSnapshotV3{
-			SchemaVersion: snapshot.SchemaVersion, Version: snapshot.Version, ExpectedCurrentVersion: snapshot.ExpectedCurrentVersion,
-			GeneratedAt: snapshot.GeneratedAt.UTC(), BlockRCode: snapshot.BlockRCode, Rules: rules, SubscriptionSets: canonicalSets,
-		}
-	} else {
-		canonical = canonicalSnapshotLegacy{
-			SchemaVersion: snapshot.SchemaVersion, Version: snapshot.Version, ExpectedCurrentVersion: snapshot.ExpectedCurrentVersion,
-			GeneratedAt: snapshot.GeneratedAt.UTC(), BlockRCode: snapshot.BlockRCode, Rules: rules, SubscriptionSets: sets,
-		}
+	}
+	canonical := canonicalSnapshotV4{
+		SchemaVersion: snapshot.SchemaVersion, Version: snapshot.Version, ExpectedCurrentVersion: snapshot.ExpectedCurrentVersion,
+		GeneratedAt: snapshot.GeneratedAt.UTC(), BlockRCode: snapshot.BlockRCode, Rules: rules, SubscriptionSets: canonicalSets,
 	}
 	b, err := json.Marshal(canonical)
 	if err != nil {
@@ -524,27 +483,17 @@ func checksumSnapshot(snapshot Snapshot, rules []Rule, sets []SubscriptionSet) (
 	return "sha256:" + hex.EncodeToString(sum[:]), rules, nil
 }
 
-type canonicalSnapshotLegacy struct {
-	SchemaVersion          uint32            `json:"schema_version"`
-	Version                uint64            `json:"version"`
-	ExpectedCurrentVersion uint64            `json:"expected_current_version"`
-	GeneratedAt            time.Time         `json:"generated_at"`
-	BlockRCode             int               `json:"block_rcode"`
-	Rules                  []Rule            `json:"rules"`
-	SubscriptionSets       []SubscriptionSet `json:"subscription_sets,omitempty"`
-}
-
-type canonicalSnapshotV3 struct {
+type canonicalSnapshotV4 struct {
 	SchemaVersion          uint32                       `json:"schema_version"`
 	Version                uint64                       `json:"version"`
 	ExpectedCurrentVersion uint64                       `json:"expected_current_version"`
 	GeneratedAt            time.Time                    `json:"generated_at"`
 	BlockRCode             int                          `json:"block_rcode"`
 	Rules                  []Rule                       `json:"rules"`
-	SubscriptionSets       []canonicalSubscriptionSetV3 `json:"subscription_sets"`
+	SubscriptionSets       []canonicalSubscriptionSetV4 `json:"subscription_sets"`
 }
 
-type canonicalSubscriptionSetV3 struct {
+type canonicalSubscriptionSetV4 struct {
 	SourceID        int64    `json:"source_id"`
 	SourceName      string   `json:"source_name"`
 	Category        string   `json:"category"`
