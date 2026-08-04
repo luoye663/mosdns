@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"go.uber.org/zap"
@@ -87,6 +88,48 @@ func TestCanonicalSnapshotDefaultsAndValidatesScheduling(t *testing.T) {
 	}
 	if _, err := canonical(Snapshot{Version: 1, Mode: "unknown", Concurrent: 1, Upstreams: snapshot.Upstreams}); err == nil {
 		t.Fatal("invalid mode was accepted")
+	}
+}
+
+func TestCanonicalSnapshotNormalizesDefaultUDPAddresses(t *testing.T) {
+	tests := []struct {
+		name string
+		addr string
+		want string
+	}{
+		{name: "IPv4", addr: "8.8.8.8", want: "udp://8.8.8.8"},
+		{name: "IPv4 with port", addr: "8.8.8.8:5353", want: "udp://8.8.8.8:5353"},
+		{name: "hostname", addr: "dns.example", want: "udp://dns.example"},
+		{name: "IPv6", addr: "2001:4860:4860::8888", want: "udp://[2001:4860:4860::8888]"},
+		{name: "IPv6 with port", addr: "[2001:4860:4860::8888]:5353", want: "udp://[2001:4860:4860::8888]:5353"},
+		{name: "explicit protocol", addr: "tcp://8.8.8.8", want: "tcp://8.8.8.8"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			snapshot, err := canonical(Snapshot{Version: 1, Concurrent: 1, Upstreams: []Upstream{{Tag: "first", Addr: test.addr}}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := snapshot.Upstreams[0].Addr; got != test.want {
+				t.Fatalf("address=%q, want %q", got, test.want)
+			}
+		})
+	}
+}
+
+func TestCanonicalSnapshotRejectsInvalidAddresses(t *testing.T) {
+	tests := []struct {
+		addr string
+		want string
+	}{
+		{addr: "", want: "address must be a valid"},
+		{addr: "ftp://8.8.8.8", want: "unsupported scheme"},
+	}
+	for _, test := range tests {
+		_, err := canonical(Snapshot{Version: 1, Concurrent: 1, Upstreams: []Upstream{{Tag: "first", Addr: test.addr}}})
+		if err == nil || !strings.Contains(err.Error(), test.want) {
+			t.Fatalf("address=%q error=%v, want substring %q", test.addr, err, test.want)
+		}
 	}
 }
 

@@ -13,6 +13,7 @@ import (
 	"io"
 	"math/rand/v2"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -304,6 +305,13 @@ func canonical(snapshot Snapshot) (Snapshot, error) {
 	for i := range snapshot.Upstreams {
 		item := &snapshot.Upstreams[i]
 		item.Tag, item.Addr = strings.TrimSpace(item.Tag), strings.TrimSpace(item.Addr)
+		if !strings.Contains(item.Addr, "://") {
+			if ip, err := netip.ParseAddr(item.Addr); err == nil && ip.Is6() {
+				item.Addr = "udp://[" + ip.String() + "]"
+			} else {
+				item.Addr = "udp://" + item.Addr
+			}
+		}
 		if item.Priority == 0 {
 			item.Priority = 100
 		}
@@ -325,7 +333,7 @@ func canonical(snapshot Snapshot) (Snapshot, error) {
 		seen[item.Tag] = struct{}{}
 		parsed, err := url.ParseRequestURI(item.Addr)
 		if err != nil || parsed.Scheme == "" || parsed.Host == "" {
-			return Snapshot{}, fmt.Errorf("upstream %d has an invalid address", i+1)
+			return Snapshot{}, fmt.Errorf("upstream %d address must be a valid [protocol://]host[:port][/path]", i+1)
 		}
 		switch parsed.Scheme {
 		case "https", "tls", "tcp", "udp", "quic":
