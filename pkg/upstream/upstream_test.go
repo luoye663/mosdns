@@ -156,7 +156,9 @@ func TestHostnameUpstreamsUseBootstrap(t *testing.T) {
 		bootstrapQueries.Add(1)
 		response := new(dns.Msg)
 		response.SetReply(q)
-		response.Answer = []dns.RR{&dns.A{Hdr: dns.RR_Header{Name: q.Question[0].Name, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 60}, A: net.ParseIP("127.0.0.1")}}
+		if q.Question[0].Qtype == dns.TypeA {
+			response.Answer = []dns.RR{&dns.A{Hdr: dns.RR_Header{Name: q.Question[0].Name, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 60}, A: net.ParseIP("127.0.0.1")}}
+		}
 		_ = w.WriteMsg(response)
 	}))
 	defer shutdownBootstrap()
@@ -169,7 +171,7 @@ func TestHostnameUpstreamsUseBootstrap(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			u, err := NewUpstream(scheme+"://bootstrap-target.invalid:"+port, Opt{Bootstrap: bootstrapAddr, BootstrapVer: 4, TLSConfig: &tls.Config{InsecureSkipVerify: true}})
+			u, err := NewUpstream(scheme+"://bootstrap-target.invalid:"+port, Opt{Bootstrap: bootstrapAddr, BootstrapVer: 46, TLSConfig: &tls.Config{InsecureSkipVerify: true}})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -179,8 +181,71 @@ func TestHostnameUpstreamsUseBootstrap(t *testing.T) {
 			}
 		})
 	}
-	if bootstrapQueries.Load() < 3 {
-		t.Fatalf("bootstrap received %d queries, want at least one per protocol", bootstrapQueries.Load())
+	if bootstrapQueries.Load() < 6 {
+		t.Fatalf("bootstrap received %d queries, want A and AAAA for every protocol", bootstrapQueries.Load())
+	}
+}
+
+func TestDualStackBootstrapFallsBackWithinSameExchange(t *testing.T) {
+	bootstrapAddr, shutdownBootstrap := newUDPTestServer(t, dns.HandlerFunc(func(w dns.ResponseWriter, q *dns.Msg) {
+		response := new(dns.Msg)
+		response.SetReply(q)
+		switch q.Question[0].Qtype {
+		case dns.TypeA:
+			response.Answer = []dns.RR{&dns.A{Hdr: dns.RR_Header{Name: q.Question[0].Name, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 60}, A: net.ParseIP("127.0.0.2")}}
+		case dns.TypeAAAA:
+			response.Answer = []dns.RR{&dns.AAAA{Hdr: dns.RR_Header{Name: q.Question[0].Name, Rrtype: dns.TypeAAAA, Class: dns.ClassINET, Ttl: 60}, AAAA: net.ParseIP("::1")}}
+		}
+		_ = w.WriteMsg(response)
+	}))
+	defer shutdownBootstrap()
+
+	for _, scheme := range []string{"udp", "tcp"} {
+		t.Run(scheme, func(t *testing.T) {
+			var server dns.Server
+			var addr string
+			if scheme == "udp" {
+				conn, err := net.ListenPacket("udp6", "[::1]:0")
+				if err != nil {
+					t.Skipf("IPv6 loopback unavailable: %v", err)
+				}
+				addr = conn.LocalAddr().String()
+				server = dns.Server{PacketConn: conn, Handler: &vServer{}}
+			} else {
+				listener, err := net.Listen("tcp6", "[::1]:0")
+				if err != nil {
+					t.Skipf("IPv6 loopback unavailable: %v", err)
+				}
+				addr = listener.Addr().String()
+				server = dns.Server{Listener: listener, Handler: &vServer{}, MaxTCPQueries: -1}
+			}
+			go func() { _ = server.ActivateAndServe() }()
+			defer server.Shutdown()
+			_, port, err := net.SplitHostPort(addr)
+			if err != nil {
+				t.Fatal(err)
+			}
+			u, err := NewUpstream(scheme+"://dual-stack-target.invalid:"+port, Opt{Bootstrap: bootstrapAddr, BootstrapVer: 46})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer u.Close()
+			query := new(dns.Msg)
+			query.SetQuestion("example.com.", dns.TypeA)
+			payload, err := query.Pack()
+			if err != nil {
+				t.Fatal(err)
+			}
+			ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+			defer cancel()
+			response, err := u.ExchangeContext(ctx, payload)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if response == nil {
+				t.Fatal("empty DNS response")
+			}
+		})
 	}
 }
 

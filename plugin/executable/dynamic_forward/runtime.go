@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/IrineSistiana/mosdns/v5/pkg/query_context"
+	upstreambootstrap "github.com/IrineSistiana/mosdns/v5/pkg/upstream/bootstrap"
 	fastforward "github.com/IrineSistiana/mosdns/v5/plugin/executable/forward"
 	"github.com/miekg/dns"
 	"go.uber.org/zap"
@@ -73,8 +74,8 @@ func CanonicalRuntimeConfig(config RuntimeConfig) (RuntimeConfig, error) {
 	if config.BootstrapVer == 0 {
 		config.BootstrapVer = 4
 	}
-	if config.BootstrapVer != 4 && config.BootstrapVer != 6 {
-		return RuntimeConfig{}, errors.New("bootstrap_version must be 4 or 6")
+	if config.BootstrapVer != 4 && config.BootstrapVer != 6 && config.BootstrapVer != upstreambootstrap.DualStackVersion {
+		return RuntimeConfig{}, errors.New("bootstrap_version must be 4, 6 or 46")
 	}
 	config.Upstreams = append([]Upstream(nil), config.Upstreams...)
 	seen := make(map[string]struct{}, len(config.Upstreams))

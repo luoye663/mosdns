@@ -43,6 +43,7 @@ func TestCanonicalRuntimeConfigBootstrap(t *testing.T) {
 		wantVer   int
 	}{
 		{name: "default version", bootstrap: " 1.1.1.1 ", want: "1.1.1.1", wantVer: 4},
+		{name: "dual stack", bootstrap: "1.1.1.1", version: 46, want: "1.1.1.1", wantVer: 46},
 		{name: "ipv4 with port", bootstrap: "223.5.5.5:5353", version: 4, want: "223.5.5.5:5353", wantVer: 4},
 		{name: "ipv6", bootstrap: "2400:3200::1", version: 6, want: "2400:3200::1", wantVer: 6},
 		{name: "ipv6 with port", bootstrap: "[2400:3200::1]:5353", version: 6, want: "[2400:3200::1]:5353", wantVer: 6},

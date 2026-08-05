@@ -105,8 +105,7 @@ type Opt struct {
 	// It must be an IP address. Port is optional.
 	Bootstrap string
 
-	// Bootstrap version. One of 0 (default equals 4), 4, 6.
-	// TODO: Support dual-stack.
+	// Bootstrap version. One of 0 (default equals 4), 4, 6, 46 (dual stack).
 	BootstrapVer int
 
 	// TLSConfig specifies the tls.Config that the TLS client will use.
@@ -172,6 +171,9 @@ func NewUpstream(addr string, opt Opt) (_ Upstream, err error) {
 		if err != nil {
 			return nil, fmt.Errorf("invalid bootstrap, %w", err)
 		}
+	}
+	if dualStackUpstream, handled, err := maybeNewDualStackBootstrapUpstream(addr, addrURL.Scheme, addrUrlHost, bootstrapAp, opt); handled {
+		return dualStackUpstream, err
 	}
 
 	newUdpAddrResolveFunc := func(defaultPort uint16) (func(ctx context.Context) (*net.UDPAddr, error), error) {
@@ -464,6 +466,7 @@ func NewUpstream(addr string, opt Opt) (_ Upstream, err error) {
 				// MaxConnsPerHost:     2,
 				// MaxIdleConnsPerHost: 2,
 			}
+			addonCloser = closeIdleConnectionsFunc(t1.CloseIdleConnections)
 
 			t2, err := http2.ConfigureTransports(t1)
 			if err != nil {
@@ -547,12 +550,13 @@ func NewUpstream(addr string, opt Opt) (_ Upstream, err error) {
 			return transport.NewQuicDnsConn(c), nil
 		}
 
-		return transport.NewPipelineTransport(transport.PipelineOpts{
+		pipeline := transport.NewPipelineTransport(transport.PipelineOpts{
 			DialContext: dialDnsConn,
 			// Quic rfc recommendation is 100. Some implications use 65535.
 			MaxConcurrentQueryWhileDialing: 90,
 			Logger:                         opt.Logger,
-		}), nil
+		})
+		return &upstreamWithCloser{u: pipeline, closer: t}, nil
 	default:
 		return nil, fmt.Errorf("unsupported protocol [%s]", addrURL.Scheme)
 	}
@@ -584,6 +588,23 @@ func (u *udpWithFallback) Close() error {
 type dohWithClose struct {
 	u      *doh.Upstream
 	closer io.Closer // maybe nil
+}
+
+type closeIdleConnectionsFunc func()
+
+func (f closeIdleConnectionsFunc) Close() error { f(); return nil }
+
+type upstreamWithCloser struct {
+	u      Upstream
+	closer io.Closer
+}
+
+func (u *upstreamWithCloser) ExchangeContext(ctx context.Context, query []byte) (*[]byte, error) {
+	return u.u.ExchangeContext(ctx, query)
+}
+
+func (u *upstreamWithCloser) Close() error {
+	return errors.Join(u.u.Close(), u.closer.Close())
 }
 
 func (u *dohWithClose) ExchangeContext(ctx context.Context, m []byte) (*[]byte, error) {

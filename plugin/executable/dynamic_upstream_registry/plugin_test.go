@@ -141,6 +141,12 @@ func TestCanonicalSnapshotValidation(t *testing.T) {
 	if canonical.Protection.GlobalMaxInFlight != 1024 || canonical.Protection.DefaultGroupMaxInFlight != 256 || canonical.Protection.DefaultGroupQueryTimeoutMS != 5000 || canonical.Protection.OverloadAction != "servfail" {
 		t.Fatalf("canonical protection = %+v", canonical.Protection)
 	}
+	dualStack := valid
+	dualStack.Groups = append([]Group(nil), valid.Groups...)
+	dualStack.Groups[0].BootstrapVer = 46
+	if canonical, err := canonicalWithoutRuntime(dualStack); err != nil || canonical.Groups[0].BootstrapVer != 46 {
+		t.Fatalf("dual-stack canonicalization = %+v err=%v", canonical, err)
+	}
 	legacy := valid
 	legacy.SchemaVersion = 1
 	if migrated, err := canonicalWithoutRuntime(legacy); err != nil || migrated.SchemaVersion != registrySchemaVersion {
