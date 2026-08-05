@@ -70,10 +70,11 @@ type Args struct {
 }
 
 type UpstreamConfig struct {
-	Tag         string `yaml:"tag"`
-	Addr        string `yaml:"addr"` // Required.
-	DialAddr    string `yaml:"dial_addr"`
-	IdleTimeout int    `yaml:"idle_timeout"`
+	Tag          string        `yaml:"tag"`
+	Addr         string        `yaml:"addr"` // Required.
+	DialAddr     string        `yaml:"dial_addr"`
+	IdleTimeout  int           `yaml:"idle_timeout"`
+	QueryTimeout time.Duration `yaml:"-"`
 
 	// Deprecated: This option has no affect.
 	// TODO: (v6) Remove this option.
@@ -316,8 +317,11 @@ func (f *Forward) exchange(ctx context.Context, qCtx *query_context.Context, us 
 		go func(uqid uint32, question dns.Question) {
 			defer workers.Done()
 			defer pool.ReleaseBuf(qc)
-			// Give each upstream a fixed timeout to finish the query.
-			upstreamCtx, cancel := context.WithTimeout(racingCtx, queryTimeout)
+			timeout := u.cfg.QueryTimeout
+			if timeout <= 0 {
+				timeout = queryTimeout
+			}
+			upstreamCtx, cancel := context.WithTimeout(racingCtx, timeout)
 			defer cancel()
 
 			var r *dns.Msg

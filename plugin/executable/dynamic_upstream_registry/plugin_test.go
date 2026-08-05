@@ -137,6 +137,21 @@ func TestCanonicalSnapshotValidation(t *testing.T) {
 	if canonical.Groups[0].Mode != "race" || canonical.Cache.Negative.TTL != 30 {
 		t.Fatalf("canonical = %+v", canonical)
 	}
+	if canonical.Protection.GlobalMaxInFlight != 1024 || canonical.Protection.DefaultGroupMaxInFlight != 256 || canonical.Protection.DefaultGroupQueryTimeoutMS != 5000 || canonical.Protection.OverloadAction != "servfail" {
+		t.Fatalf("canonical protection = %+v", canonical.Protection)
+	}
+	legacy := valid
+	legacy.SchemaVersion = 1
+	if migrated, err := canonicalWithoutRuntime(legacy); err != nil || migrated.SchemaVersion != registrySchemaVersion {
+		t.Fatalf("legacy migration = %+v err=%v", migrated, err)
+	}
+	overrideAboveGlobal := valid
+	overrideAboveGlobal.Groups = append([]Group(nil), valid.Groups...)
+	groupLimit := 2000
+	overrideAboveGlobal.Groups[0].MaxInFlight = &groupLimit
+	if _, err := canonicalWithoutRuntime(overrideAboveGlobal); err != nil {
+		t.Fatalf("group override above global should remain valid: %v", err)
+	}
 	for name, mutate := range map[string]func(*Snapshot){
 		"schema":           func(s *Snapshot) { s.SchemaVersion = 0 },
 		"version":          func(s *Snapshot) { s.Version = 0 },
@@ -146,6 +161,10 @@ func TestCanonicalSnapshotValidation(t *testing.T) {
 		"cache total":      func(s *Snapshot) { s.Groups[0].Cache.Size = maximumCacheEntries + 1 },
 		"ecs":              func(s *Snapshot) { s.Groups[0].ECS = dynamic_ecs.Config{Mode: "fixed_subnet"} },
 		"mode":             func(s *Snapshot) { s.Groups[0].Mode = "invalid" },
+		"global limit":     func(s *Snapshot) { s.Protection.GlobalMaxInFlight = 65536 },
+		"group default":    func(s *Snapshot) { s.Protection.DefaultGroupMaxInFlight = 1025 },
+		"group timeout":    func(s *Snapshot) { s.Protection.DefaultGroupQueryTimeoutMS = 30001 },
+		"overload action":  func(s *Snapshot) { s.Protection.OverloadAction = "invalid" },
 	} {
 		t.Run(name, func(t *testing.T) {
 			value := valid
@@ -155,6 +174,49 @@ func TestCanonicalSnapshotValidation(t *testing.T) {
 				t.Fatal("invalid snapshot accepted")
 			}
 		})
+	}
+}
+
+func TestConcurrencyLimitsAndOverloadAction(t *testing.T) {
+	server := startDNSServer(t, "192.0.2.40", dns.RcodeSuccess, nil)
+	configured := snapshot(1, group("default", "Default", server.addr))
+	configured.Protection = ProtectionConfig{GlobalMaxInFlight: 1, DefaultGroupMaxInFlight: 1, DefaultGroupQueryTimeoutMS: 5000, OverloadAction: "refused"}
+	p, _ := newTestPlugin(t, configured)
+
+	p.globalInFlight.Store(1)
+	qCtx := query("global-overload.example.")
+	if err := p.Exec(t.Context(), qCtx); !errors.Is(err, errOverloaded) {
+		t.Fatalf("global overload error = %v", err)
+	}
+	if action, ok := query_context.OverloadActionFromContext(qCtx); !ok || action != query_context.OverloadREFUSED {
+		t.Fatalf("global overload action = %q ok=%t", action, ok)
+	}
+	p.globalInFlight.Store(0)
+
+	state := p.current.Load()
+	state.groups["default"].inFlight.Store(1)
+	qCtx = query("group-overload.example.")
+	if err := p.Exec(t.Context(), qCtx); !errors.Is(err, errOverloaded) {
+		t.Fatalf("group overload error = %v", err)
+	}
+	if action, ok := query_context.OverloadActionFromContext(qCtx); !ok || action != query_context.OverloadREFUSED {
+		t.Fatalf("group overload action = %q ok=%t", action, ok)
+	}
+}
+
+func TestGroupQueryTimeoutCapsAllUpstreamWork(t *testing.T) {
+	slow := startDNSServer(t, "192.0.2.41", dns.RcodeSuccess, func(*dns.Msg) { time.Sleep(2 * time.Second) })
+	g := group("default", "Default", slow.addr)
+	timeout := 1000
+	g.QueryTimeoutMS = &timeout
+	g.Upstreams[0].TimeoutMS = 4000
+	p, _ := newTestPlugin(t, snapshot(1, g))
+	started := time.Now()
+	if err := p.Exec(t.Context(), query("group-timeout.example.")); err == nil {
+		t.Fatal("group timeout returned no error")
+	}
+	if elapsed := time.Since(started); elapsed < 900*time.Millisecond || elapsed > 1500*time.Millisecond {
+		t.Fatalf("group timeout elapsed = %s", elapsed)
 	}
 }
 
@@ -291,8 +353,77 @@ func TestForwardModes(t *testing.T) {
 	}
 }
 
-func TestRaceQueriesAllUpstreamsBeyondBoundedConcurrency(t *testing.T) {
-	const upstreamCount = 18
+func TestWeightedFallsBackAfterRetryableResponse(t *testing.T) {
+	failed := startDNSServer(t, "", dns.RcodeServerFailure, nil)
+	success := startDNSServer(t, "192.0.2.30", dns.RcodeSuccess, nil)
+	g := group("default", "Default", failed.addr)
+	g.Mode = "weighted"
+	g.Concurrent = 1
+	g.Upstreams = []dynamic_forward.Upstream{
+		{Tag: "likely_first", Addr: failed.addr, Weight: 100},
+		{Tag: "fallback", Addr: success.addr, Weight: 1},
+	}
+	p, _ := newTestPlugin(t, snapshot(1, g))
+	for i := 0; i < 20 && failed.requests.Load() == 0; i++ {
+		qCtx := query(fmt.Sprintf("weighted-fallback-%d.example.", i))
+		if err := p.Exec(t.Context(), qCtx); err != nil {
+			t.Fatal(err)
+		}
+		if got := answerIP(t, qCtx); got != "192.0.2.30" {
+			t.Fatalf("answer = %s", got)
+		}
+	}
+	if failed.requests.Load() == 0 || success.requests.Load() == 0 {
+		t.Fatalf("requests failed=%d success=%d", failed.requests.Load(), success.requests.Load())
+	}
+}
+
+func TestFailoverUsesNodeTimeoutAndRetriesRefused(t *testing.T) {
+	t.Run("timeout", func(t *testing.T) {
+		primary := startDNSServer(t, "", dns.RcodeSuccess, func(*dns.Msg) { time.Sleep(500 * time.Millisecond) })
+		backup := startDNSServer(t, "192.0.2.31", dns.RcodeSuccess, nil)
+		g := group("default", "Default", primary.addr)
+		g.Mode = "failover"
+		g.Upstreams = []dynamic_forward.Upstream{
+			{Tag: "primary", Addr: primary.addr, Priority: 1, TimeoutMS: 100},
+			{Tag: "backup", Addr: backup.addr, Priority: 2, TimeoutMS: 1000},
+		}
+		p, _ := newTestPlugin(t, snapshot(1, g))
+		started := time.Now()
+		qCtx := query("timeout-failover.example.")
+		if err := p.Exec(t.Context(), qCtx); err != nil {
+			t.Fatal(err)
+		}
+		if got := answerIP(t, qCtx); got != "192.0.2.31" {
+			t.Fatalf("answer = %s", got)
+		}
+		if elapsed := time.Since(started); elapsed >= 400*time.Millisecond {
+			t.Fatalf("failover took %s, node timeout was not applied", elapsed)
+		}
+	})
+
+	t.Run("refused", func(t *testing.T) {
+		primary := startDNSServer(t, "", dns.RcodeRefused, nil)
+		backup := startDNSServer(t, "192.0.2.32", dns.RcodeSuccess, nil)
+		g := group("default", "Default", primary.addr)
+		g.Mode = "failover"
+		g.Upstreams = []dynamic_forward.Upstream{
+			{Tag: "primary", Addr: primary.addr, Priority: 1},
+			{Tag: "backup", Addr: backup.addr, Priority: 2},
+		}
+		p, _ := newTestPlugin(t, snapshot(1, g))
+		qCtx := query("refused-failover.example.")
+		if err := p.Exec(t.Context(), qCtx); err != nil {
+			t.Fatal(err)
+		}
+		if got := answerIP(t, qCtx); got != "192.0.2.32" {
+			t.Fatalf("answer = %s", got)
+		}
+	})
+}
+
+func TestRaceQueriesAllAllowedUpstreams(t *testing.T) {
+	const upstreamCount = 16
 	var arrived atomic.Int32
 	allArrived := make(chan struct{})
 	var releaseOnce sync.Once
@@ -325,10 +456,10 @@ func TestRaceQueriesAllUpstreamsBeyondBoundedConcurrency(t *testing.T) {
 }
 
 func TestFailoverExhaustsPriorityLevelInBatches(t *testing.T) {
-	const primaryCount = 17
+	const primaryCount = 15
 	g := group("default", "Default", "udp://127.0.0.1:53")
 	g.Mode = "failover"
-	g.Concurrent = 16
+	g.Concurrent = 8
 	g.Upstreams = make([]dynamic_forward.Upstream, 0, primaryCount+1)
 	primaries := make([]*testDNSServer, 0, primaryCount)
 	for i := 0; i < primaryCount; i++ {

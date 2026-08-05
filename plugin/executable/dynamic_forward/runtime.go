@@ -11,6 +11,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/IrineSistiana/mosdns/v5/pkg/query_context"
 	fastforward "github.com/IrineSistiana/mosdns/v5/plugin/executable/forward"
@@ -20,13 +21,20 @@ import (
 
 var tagPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
 
-const maxConcurrentQueries = 16
+const (
+	maxConcurrentQueries = 16
+	maxUpstreams         = 16
+	defaultTimeoutMS     = 1000
+	minimumTimeoutMS     = 100
+	maximumTimeoutMS     = 4000
+)
 
 type Upstream struct {
-	Tag      string `json:"tag" yaml:"tag"`
-	Addr     string `json:"addr" yaml:"addr"`
-	Priority int    `json:"priority" yaml:"priority"`
-	Weight   int    `json:"weight" yaml:"weight"`
+	Tag       string `json:"tag" yaml:"tag"`
+	Addr      string `json:"addr" yaml:"addr"`
+	Priority  int    `json:"priority" yaml:"priority"`
+	Weight    int    `json:"weight" yaml:"weight"`
+	TimeoutMS int    `json:"timeout_ms" yaml:"timeout_ms"`
 }
 
 type RuntimeConfig struct {
@@ -46,8 +54,8 @@ func CanonicalRuntimeConfig(config RuntimeConfig) (RuntimeConfig, error) {
 	if config.Mode != "race" && config.Mode != "weighted" && config.Mode != "failover" {
 		return RuntimeConfig{}, errors.New("mode must be race, weighted or failover")
 	}
-	if len(config.Upstreams) == 0 {
-		return RuntimeConfig{}, errors.New("upstreams must contain at least one entry")
+	if len(config.Upstreams) < 1 || len(config.Upstreams) > maxUpstreams {
+		return RuntimeConfig{}, errors.New("upstreams must contain 1..16 entries")
 	}
 	config.Socks5 = strings.TrimSpace(config.Socks5)
 	config.Upstreams = append([]Upstream(nil), config.Upstreams...)
@@ -68,11 +76,17 @@ func CanonicalRuntimeConfig(config RuntimeConfig) (RuntimeConfig, error) {
 		if item.Weight == 0 {
 			item.Weight = 1
 		}
+		if item.TimeoutMS == 0 {
+			item.TimeoutMS = defaultTimeoutMS
+		}
 		if item.Priority < 1 || item.Priority > 1000 {
 			return RuntimeConfig{}, fmt.Errorf("upstream %d priority must be within 1..1000", i+1)
 		}
 		if item.Weight < 1 || item.Weight > 100 {
 			return RuntimeConfig{}, fmt.Errorf("upstream %d weight must be within 1..100", i+1)
+		}
+		if item.TimeoutMS < minimumTimeoutMS || item.TimeoutMS > maximumTimeoutMS {
+			return RuntimeConfig{}, fmt.Errorf("upstream %d timeout_ms must be within 100..4000", i+1)
 		}
 		if !tagPattern.MatchString(item.Tag) {
 			return RuntimeConfig{}, fmt.Errorf("upstream %d has an invalid tag", i+1)
@@ -117,22 +131,26 @@ func NewRuntime(mode string, concurrent int, socks5 string, upstreams []Upstream
 func (r *Runtime) Exec(ctx context.Context, qCtx *query_context.Context) error {
 	switch r.mode {
 	case "weighted":
-		return r.forward.ExecWithTags(ctx, qCtx, weightedTags(r.items, r.count))
+		accepted, err := r.execCandidates(ctx, qCtx, weightedTags(r.items, len(r.items)))
+		if accepted || qCtx.R() != nil {
+			return nil
+		}
+		return err
 	case "failover":
 		var lastErr error
 		for _, level := range r.levels {
 			candidates := append([]string(nil), level...)
 			rand.Shuffle(len(candidates), func(i, j int) { candidates[i], candidates[j] = candidates[j], candidates[i] })
-			for start := 0; start < len(candidates); start += r.count {
-				end := min(start+r.count, len(candidates))
-				if err := r.forward.ExecWithTags(ctx, qCtx, candidates[start:end]); err != nil {
-					lastErr = err
-					continue
-				}
-				if response := qCtx.R(); response == nil || response.Rcode != dns.RcodeServerFailure {
-					return nil
-				}
+			accepted, err := r.execCandidates(ctx, qCtx, candidates)
+			if accepted {
+				return nil
 			}
+			if err != nil {
+				lastErr = err
+			}
+		}
+		if qCtx.R() != nil {
+			return nil
 		}
 		return lastErr
 	default:
@@ -140,12 +158,31 @@ func (r *Runtime) Exec(ctx context.Context, qCtx *query_context.Context) error {
 	}
 }
 
+func (r *Runtime) execCandidates(ctx context.Context, qCtx *query_context.Context, candidates []string) (bool, error) {
+	var lastErr error
+	for start := 0; start < len(candidates); start += r.count {
+		if err := context.Cause(ctx); err != nil {
+			return false, err
+		}
+		end := min(start+r.count, len(candidates))
+		if err := r.forward.ExecWithTags(ctx, qCtx, candidates[start:end]); err != nil {
+			lastErr = err
+			continue
+		}
+		response := qCtx.R()
+		if response == nil || (response.Rcode != dns.RcodeServerFailure && response.Rcode != dns.RcodeRefused) {
+			return true, nil
+		}
+	}
+	return false, lastErr
+}
+
 func (r *Runtime) Close() error { return r.forward.Close() }
 
 func forwardUpstreams(items []Upstream) []fastforward.UpstreamConfig {
 	result := make([]fastforward.UpstreamConfig, 0, len(items))
 	for _, item := range items {
-		result = append(result, fastforward.UpstreamConfig{Tag: item.Tag, Addr: item.Addr})
+		result = append(result, fastforward.UpstreamConfig{Tag: item.Tag, Addr: item.Addr, QueryTimeout: time.Duration(item.TimeoutMS) * time.Millisecond})
 	}
 	return result
 }

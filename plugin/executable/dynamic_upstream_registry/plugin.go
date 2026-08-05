@@ -16,6 +16,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/IrineSistiana/mosdns/v5/coremain"
 	"github.com/IrineSistiana/mosdns/v5/pkg/query_context"
@@ -25,12 +26,13 @@ import (
 	"github.com/IrineSistiana/mosdns/v5/plugin/executable/dynamic_rule_engine"
 	"github.com/IrineSistiana/mosdns/v5/plugin/executable/sequence"
 	"github.com/go-chi/chi/v5"
+	"github.com/prometheus/client_golang/prometheus"
 	"go.uber.org/zap"
 )
 
 const (
 	PluginType            = "dynamic_upstream_registry"
-	registrySchemaVersion = 1
+	registrySchemaVersion = 2
 	defaultCacheSize      = 1024
 	maximumCacheEntries   = 65536
 	maximumBodyBytes      = 4 << 20
@@ -53,18 +55,28 @@ type Snapshot struct {
 	DefaultGroupID         string            `json:"default_group_id" yaml:"default_group_id"`
 	Groups                 []Group           `json:"groups" yaml:"groups"`
 	Cache                  GlobalCacheConfig `json:"cache" yaml:"cache"`
+	Protection             ProtectionConfig  `json:"protection" yaml:"protection"`
 }
 
 type Group struct {
-	ID         string                     `json:"id" yaml:"id"`
-	Name       string                     `json:"name" yaml:"name"`
-	Enabled    bool                       `json:"enabled" yaml:"enabled"`
-	Mode       string                     `json:"mode" yaml:"mode"`
-	Concurrent int                        `json:"concurrent" yaml:"concurrent"`
-	Socks5     string                     `json:"socks5,omitempty" yaml:"socks5"`
-	Upstreams  []dynamic_forward.Upstream `json:"upstreams" yaml:"upstreams"`
-	ECS        dynamic_ecs.Config         `json:"ecs" yaml:"ecs"`
-	Cache      GroupCacheConfig           `json:"cache" yaml:"cache"`
+	ID             string                     `json:"id" yaml:"id"`
+	Name           string                     `json:"name" yaml:"name"`
+	Enabled        bool                       `json:"enabled" yaml:"enabled"`
+	Mode           string                     `json:"mode" yaml:"mode"`
+	Concurrent     int                        `json:"concurrent" yaml:"concurrent"`
+	Socks5         string                     `json:"socks5,omitempty" yaml:"socks5"`
+	MaxInFlight    *int                       `json:"max_in_flight,omitempty" yaml:"max_in_flight"`
+	QueryTimeoutMS *int                       `json:"query_timeout_ms,omitempty" yaml:"query_timeout_ms"`
+	Upstreams      []dynamic_forward.Upstream `json:"upstreams" yaml:"upstreams"`
+	ECS            dynamic_ecs.Config         `json:"ecs" yaml:"ecs"`
+	Cache          GroupCacheConfig           `json:"cache" yaml:"cache"`
+}
+
+type ProtectionConfig struct {
+	GlobalMaxInFlight          int    `json:"global_max_in_flight" yaml:"global_max_in_flight"`
+	DefaultGroupMaxInFlight    int    `json:"default_group_max_in_flight" yaml:"default_group_max_in_flight"`
+	DefaultGroupQueryTimeoutMS int    `json:"default_group_query_timeout_ms" yaml:"default_group_query_timeout_ms"`
+	OverloadAction             string `json:"overload_action" yaml:"overload_action"`
 }
 
 type GroupCacheConfig struct {
@@ -84,9 +96,10 @@ type NegativeCacheConfig struct {
 }
 
 type runtimeGroup struct {
-	config  Group
-	forward *dynamic_forward.Runtime
-	cache   *cacheplugin.Runtime
+	config   Group
+	forward  *dynamic_forward.Runtime
+	cache    *cacheplugin.Runtime
+	inFlight *atomic.Int64
 }
 
 func (g *runtimeGroup) close() {
@@ -118,17 +131,27 @@ func (s *runtimeState) closeWhenIdle() {
 }
 
 type Plugin struct {
-	current      atomic.Pointer[runtimeState]
-	stateMu      sync.RWMutex
-	applyMu      sync.Mutex
-	cacheDumpMu  sync.Mutex
-	closed       atomic.Bool
-	token        []byte
-	snapshotFile string
-	backupFile   string
-	cacheDumpDir string
-	logger       *zap.Logger
-	metricsTag   string
+	current        atomic.Pointer[runtimeState]
+	stateMu        sync.RWMutex
+	applyMu        sync.Mutex
+	cacheDumpMu    sync.Mutex
+	closed         atomic.Bool
+	token          []byte
+	snapshotFile   string
+	backupFile     string
+	cacheDumpDir   string
+	logger         *zap.Logger
+	metricsTag     string
+	globalInFlight atomic.Int64
+	groupCounters  sync.Map
+	metrics        protectionMetrics
+}
+
+type protectionMetrics struct {
+	inFlight  *prometheus.GaugeVec
+	limit     *prometheus.GaugeVec
+	admission *prometheus.CounterVec
+	timeouts  *prometheus.CounterVec
 }
 
 var _ sequence.Executable = (*Plugin)(nil)
@@ -143,6 +166,10 @@ func Init(bp *coremain.BP, raw any) (any, error) {
 	}
 	p, err := newPlugin(*args, bp.L(), bp.Tag())
 	if err != nil {
+		return nil, err
+	}
+	if err := p.registerMetrics(bp); err != nil {
+		_ = p.Close()
 		return nil, err
 	}
 	bp.RegAPI(p.router())
@@ -171,7 +198,7 @@ func newPlugin(args Args, logger *zap.Logger, metricsTag string) (*Plugin, error
 	if cacheDumpDir == "" {
 		cacheDumpDir = args.SnapshotFile + ".cache"
 	}
-	p := &Plugin{token: token, snapshotFile: args.SnapshotFile, backupFile: args.BackupFile, cacheDumpDir: cacheDumpDir, logger: logger, metricsTag: metricsTag}
+	p := &Plugin{token: token, snapshotFile: args.SnapshotFile, backupFile: args.BackupFile, cacheDumpDir: cacheDumpDir, logger: logger, metricsTag: metricsTag, metrics: newProtectionMetrics(prometheus.Labels{"tag": metricsTag})}
 	snapshot, source, err := loadSnapshot(args.SnapshotFile, args.BackupFile)
 	if err != nil {
 		return nil, err
@@ -195,6 +222,7 @@ func newPlugin(args Args, logger *zap.Logger, metricsTag string) (*Plugin, error
 		}
 	}
 	p.current.Store(state)
+	p.updateLimitMetrics(state.snapshot)
 	p.cleanupCacheDumps(state)
 	return p, nil
 }
@@ -228,9 +256,21 @@ func (p *Plugin) buildState(snapshot Snapshot, loadCacheDumps bool) (*runtimeSta
 				p.logger.Warn("skip unreadable cache dump", zap.String("group", config.ID), zap.Error(err))
 			}
 		}
-		state.groups[config.ID] = &runtimeGroup{config: config, forward: forward, cache: cache}
+		state.groups[config.ID] = &runtimeGroup{config: config, forward: forward, cache: cache, inFlight: p.groupCounter(config.ID)}
 	}
 	return state, nil
+}
+
+func (p *Plugin) updateLimitMetrics(snapshot Snapshot) {
+	p.metrics.limit.Reset()
+	p.metrics.limit.WithLabelValues("global", "").Set(float64(snapshot.Protection.GlobalMaxInFlight))
+	for _, config := range snapshot.Groups {
+		limit := snapshot.Protection.DefaultGroupMaxInFlight
+		if config.MaxInFlight != nil {
+			limit = *config.MaxInFlight
+		}
+		p.metrics.limit.WithLabelValues("group", config.ID).Set(float64(limit))
+	}
 }
 
 // canonicalWithoutRuntime validates values without opening network transports.
@@ -260,12 +300,43 @@ func (p *Plugin) acquire() (*runtimeState, error) {
 
 func (p *Plugin) release(state *runtimeState) { state.refs.Add(-1); state.closeWhenIdle() }
 
+var errOverloaded = errors.New("DNS concurrency limit reached")
+
+func (p *Plugin) groupCounter(id string) *atomic.Int64 {
+	value, _ := p.groupCounters.LoadOrStore(id, new(atomic.Int64))
+	return value.(*atomic.Int64)
+}
+
+func tryAcquire(counter *atomic.Int64, limit int) bool {
+	for {
+		current := counter.Load()
+		if current >= int64(limit) {
+			return false
+		}
+		if counter.CompareAndSwap(current, current+1) {
+			return true
+		}
+	}
+}
+
+func setOverloadAction(qCtx *query_context.Context, action string) {
+	query_context.SetOverloadAction(qCtx, query_context.OverloadAction(action))
+}
+
 func (p *Plugin) Exec(ctx context.Context, qCtx *query_context.Context) error {
 	state, err := p.acquire()
 	if err != nil {
 		return err
 	}
 	defer p.release(state)
+	if !tryAcquire(&p.globalInFlight, state.snapshot.Protection.GlobalMaxInFlight) {
+		setOverloadAction(qCtx, state.snapshot.Protection.OverloadAction)
+		p.metrics.admission.WithLabelValues("global", "", "rejected", state.snapshot.Protection.OverloadAction).Inc()
+		return errOverloaded
+	}
+	p.metrics.admission.WithLabelValues("global", "", "accepted", "").Inc()
+	p.metrics.inFlight.WithLabelValues("global", "").Inc()
+	defer func() { p.globalInFlight.Add(-1); p.metrics.inFlight.WithLabelValues("global", "").Dec() }()
 	groupID, source := state.snapshot.DefaultGroupID, "default"
 	if explicit, ok := query_context.UpstreamGroupID(qCtx); ok {
 		groupID, source = explicit, "subscription"
@@ -288,12 +359,65 @@ func (p *Plugin) Exec(ctx context.Context, qCtx *query_context.Context) error {
 	if err := dynamic_ecs.ApplyConfig(qCtx, group.config.ECS); err != nil {
 		return err
 	}
-	hit, upstreamTag, err := group.cache.Exec(ctx, qCtx, group.forward.Exec)
+	queryTimeoutMS := state.snapshot.Protection.DefaultGroupQueryTimeoutMS
+	if group.config.QueryTimeoutMS != nil {
+		queryTimeoutMS = *group.config.QueryTimeoutMS
+	}
+	groupCtx, cancel := context.WithTimeout(ctx, time.Duration(queryTimeoutMS)*time.Millisecond)
+	defer cancel()
+	groupLimit := state.snapshot.Protection.DefaultGroupMaxInFlight
+	if group.config.MaxInFlight != nil {
+		groupLimit = *group.config.MaxInFlight
+	}
+	limitedForward := func(forwardCtx context.Context, forwardQuery *query_context.Context) error {
+		if forwardQuery != qCtx {
+			if !tryAcquire(&p.globalInFlight, state.snapshot.Protection.GlobalMaxInFlight) {
+				setOverloadAction(forwardQuery, state.snapshot.Protection.OverloadAction)
+				p.metrics.admission.WithLabelValues("global", "", "rejected", state.snapshot.Protection.OverloadAction).Inc()
+				return errOverloaded
+			}
+			p.metrics.admission.WithLabelValues("global", "", "accepted", "").Inc()
+			p.metrics.inFlight.WithLabelValues("global", "").Inc()
+			defer func() { p.globalInFlight.Add(-1); p.metrics.inFlight.WithLabelValues("global", "").Dec() }()
+		}
+		if !tryAcquire(group.inFlight, groupLimit) {
+			setOverloadAction(forwardQuery, state.snapshot.Protection.OverloadAction)
+			p.metrics.admission.WithLabelValues("group", groupID, "rejected", state.snapshot.Protection.OverloadAction).Inc()
+			return errOverloaded
+		}
+		p.metrics.admission.WithLabelValues("group", groupID, "accepted", "").Inc()
+		p.metrics.inFlight.WithLabelValues("group", groupID).Inc()
+		defer func() { group.inFlight.Add(-1); p.metrics.inFlight.WithLabelValues("group", groupID).Dec() }()
+		return group.forward.Exec(forwardCtx, forwardQuery)
+	}
+	hit, upstreamTag, err := group.cache.Exec(groupCtx, qCtx, limitedForward)
+	if errors.Is(err, context.DeadlineExceeded) && errors.Is(groupCtx.Err(), context.DeadlineExceeded) {
+		p.metrics.timeouts.WithLabelValues(groupID).Inc()
+	}
 	if err == nil {
 		meta.UpstreamTag, meta.CacheHit = upstreamTag, hit
 		query_context.SetUpstreamRuntimeMeta(qCtx, meta)
 	}
 	return err
+}
+
+func (p *Plugin) registerMetrics(bp *coremain.BP) error {
+	registerer := prometheus.WrapRegistererWithPrefix(PluginType+"_", bp.M().GetMetricsReg())
+	for _, collector := range []prometheus.Collector{p.metrics.inFlight, p.metrics.limit, p.metrics.admission, p.metrics.timeouts} {
+		if err := registerer.Register(collector); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func newProtectionMetrics(labels prometheus.Labels) protectionMetrics {
+	return protectionMetrics{
+		inFlight:  prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "in_flight", Help: "Current admitted DNS queries.", ConstLabels: labels}, []string{"scope", "group"}),
+		limit:     prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "in_flight_limit", Help: "Configured DNS concurrency limits.", ConstLabels: labels}, []string{"scope", "group"}),
+		admission: prometheus.NewCounterVec(prometheus.CounterOpts{Name: "admission_total", Help: "DNS query admission decisions.", ConstLabels: labels}, []string{"scope", "group", "result", "action"}),
+		timeouts:  prometheus.NewCounterVec(prometheus.CounterOpts{Name: "group_timeout_total", Help: "Queries that exhausted their upstream group budget.", ConstLabels: labels}, []string{"group"}),
+	}
 }
 
 func (p *Plugin) Close() error {
@@ -388,6 +512,7 @@ func (p *Plugin) handleSnapshot(w http.ResponseWriter, r *http.Request) {
 	}
 	old := p.current.Swap(next)
 	p.stateMu.Unlock()
+	p.updateLimitMetrics(next.snapshot)
 	old.retire()
 	writeJSON(w, http.StatusOK, next.snapshot)
 }

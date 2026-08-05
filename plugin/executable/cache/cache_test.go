@@ -293,6 +293,47 @@ func TestRuntimeFlushBlocksInFlightLazyWriteback(t *testing.T) {
 	}
 }
 
+func TestRuntimeCoalescesConcurrentColdMisses(t *testing.T) {
+	runtime := newTestRuntime(t, 0)
+	const queries = 32
+	start := make(chan struct{})
+	release := make(chan struct{})
+	entered := make(chan struct{}, 1)
+	var calls atomic.Int32
+	results := make(chan error, queries)
+	forward := func(_ context.Context, qCtx *query_context.Context) error {
+		if calls.Add(1) == 1 {
+			entered <- struct{}{}
+		}
+		<-release
+		qCtx.SetResponse(runtimeResponse(qCtx.Q()))
+		return nil
+	}
+	for range queries {
+		go func() {
+			<-start
+			qCtx := query_context.NewContext(runtimeQuery("coalesced.example."))
+			_, _, err := runtime.Exec(context.Background(), qCtx, forward)
+			if err == nil && (qCtx.R() == nil || len(qCtx.R().Answer) != 1) {
+				err = errors.New("coalesced query did not receive the leader response")
+			}
+			results <- err
+		}()
+	}
+	close(start)
+	<-entered
+	time.Sleep(20 * time.Millisecond)
+	close(release)
+	for range queries {
+		if err := <-results; err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("forward calls = %d, want 1", got)
+	}
+}
+
 func TestCacheTTLAPIFlushesExistingEntries(t *testing.T) {
 	c := NewCache(&Args{Size: 16}, Opts{})
 	c.controlToken = []byte("cache-test-token")

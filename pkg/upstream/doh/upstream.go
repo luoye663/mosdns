@@ -27,17 +27,12 @@ import (
 	"io"
 	"net/http"
 	urlpkg "net/url"
-	"time"
 
 	"github.com/IrineSistiana/mosdns/v5/pkg/dnsutils"
 	"github.com/IrineSistiana/mosdns/v5/pkg/pool"
 	"github.com/IrineSistiana/mosdns/v5/pkg/utils"
 	"github.com/miekg/dns"
 	"go.uber.org/zap"
-)
-
-const (
-	defaultDoHTimeout = time.Second * 6
 )
 
 var nopLogger = zap.NewNop()
@@ -98,37 +93,14 @@ func (u *Upstream) ExchangeContext(ctx context.Context, q []byte) (*[]byte, erro
 	// See: https://tools.ietf.org/html/rfc8484#section-6.
 	base64.RawURLEncoding.Encode(queryBuf[p:], wire)
 
-	type res struct {
-		r   *[]byte
-		err error
+	r, err := u.exchange(ctx, utils.BytesToStringUnsafe(queryBuf))
+	if err != nil {
+		u.logger.Check(zap.WarnLevel, "exchange failed").Write(zap.Error(err))
 	}
-
-	resChan := make(chan res, 1)
-	go func() {
-		// We overwrite the ctx with a fixed timeout context here.
-		// Because the http package may close the underlay connection
-		// if the context is done before the query is completed. This
-		// reduces the connection reuse efficiency.
-		ctx, cancel := context.WithTimeout(context.Background(), defaultDoHTimeout)
-		defer cancel()
-		r, err := u.exchange(ctx, utils.BytesToStringUnsafe(queryBuf))
-		if err != nil {
-			u.logger.Check(zap.WarnLevel, "exchange failed").Write(zap.Error(err))
-		}
-		resChan <- res{r: r, err: err}
-	}()
-
-	select {
-	case <-ctx.Done():
-		return nil, context.Cause(ctx)
-	case res := <-resChan:
-		r := res.r
-		err := res.err
-		if r != nil {
-			binary.BigEndian.PutUint16(*r, binary.BigEndian.Uint16(q))
-		}
-		return r, err
+	if r != nil {
+		binary.BigEndian.PutUint16(*r, binary.BigEndian.Uint16(q))
 	}
+	return r, err
 }
 
 func (u *Upstream) exchange(ctx context.Context, dnsQuery string) (*[]byte, error) {

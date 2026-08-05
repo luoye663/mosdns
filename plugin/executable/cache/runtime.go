@@ -28,8 +28,18 @@ type Runtime struct {
 	mu         sync.Mutex
 	generation uint64
 	refreshing map[string]struct{}
+	flights    map[string]*flight
 	closed     bool
 	wg         sync.WaitGroup
+}
+
+type flight struct {
+	done        chan struct{}
+	response    *dns.Msg
+	upstreamTag string
+	err         error
+	action      query_context.OverloadAction
+	hasAction   bool
 }
 
 func NewRuntime(config RuntimeConfig) (*Runtime, error) {
@@ -42,7 +52,7 @@ func NewRuntime(config RuntimeConfig) (*Runtime, error) {
 	if config.NegativeTTLSeconds < 1 || config.NegativeTTLSeconds > maxNegativeCacheTTL {
 		return nil, errors.New("negative cache ttl_seconds must be within 1..86400")
 	}
-	return &Runtime{config: config, backend: cachepkg.New[key, *item](cachepkg.Opts{Size: config.Size}), refreshing: make(map[string]struct{})}, nil
+	return &Runtime{config: config, backend: cachepkg.New[key, *item](cachepkg.Opts{Size: config.Size}), refreshing: make(map[string]struct{}), flights: make(map[string]*flight)}, nil
 }
 
 // Exec performs lookup, optional lazy refresh, and store around forward.
@@ -68,8 +78,8 @@ func (r *Runtime) Exec(ctx context.Context, qCtx *query_context.Context, forward
 	}
 	r.mu.Lock()
 	response, lazy, upstreamTag := getRespFromCacheWithTag(msgKey, r.backend, r.config.LazyCacheTTL > 0, expiredMsgTtl)
-	r.mu.Unlock()
 	if response != nil {
+		r.mu.Unlock()
 		response.Id = qCtx.Q().Id
 		qCtx.SetResponse(response)
 		if lazy {
@@ -77,12 +87,42 @@ func (r *Runtime) Exec(ctx context.Context, qCtx *query_context.Context, forward
 		}
 		return true, upstreamTag, nil
 	}
-	if err := forward(ctx, qCtx); err != nil {
-		return false, "", err
+	if existing := r.flights[msgKey]; existing != nil {
+		r.mu.Unlock()
+		select {
+		case <-ctx.Done():
+			return false, "", context.Cause(ctx)
+		case <-existing.done:
+			if existing.response != nil {
+				response := existing.response.Copy()
+				response.Id = qCtx.Q().Id
+				qCtx.SetResponse(response)
+			}
+			if existing.hasAction {
+				query_context.SetOverloadAction(qCtx, existing.action)
+			}
+			return false, existing.upstreamTag, existing.err
+		}
 	}
-	upstreamTag = fastforward.SelectedUpstreamTag(qCtx)
-	r.store(msgKey, generation, qCtx.R(), upstreamTag)
-	return false, upstreamTag, nil
+	currentFlight := &flight{done: make(chan struct{})}
+	r.flights[msgKey] = currentFlight
+	r.mu.Unlock()
+
+	err := forward(ctx, qCtx)
+	if err == nil {
+		upstreamTag = fastforward.SelectedUpstreamTag(qCtx)
+		if response := qCtx.R(); response != nil {
+			currentFlight.response = response.Copy()
+		}
+		r.store(msgKey, generation, qCtx.R(), upstreamTag)
+	}
+	currentFlight.upstreamTag, currentFlight.err = upstreamTag, err
+	currentFlight.action, currentFlight.hasAction = query_context.OverloadActionFromContext(qCtx)
+	r.mu.Lock()
+	delete(r.flights, msgKey)
+	close(currentFlight.done)
+	r.mu.Unlock()
+	return false, upstreamTag, err
 }
 
 func (r *Runtime) refresh(msgKey string, generation uint64, qCtx *query_context.Context, forward func(context.Context, *query_context.Context) error) {

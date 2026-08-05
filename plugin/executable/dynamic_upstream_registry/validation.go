@@ -10,8 +10,35 @@ import (
 )
 
 func canonicalSnapshotValues(snapshot Snapshot) (Snapshot, error) {
+	if snapshot.SchemaVersion == 1 {
+		snapshot.SchemaVersion = registrySchemaVersion
+	}
 	if snapshot.SchemaVersion != registrySchemaVersion {
 		return Snapshot{}, fmt.Errorf("schema_version must be %d", registrySchemaVersion)
+	}
+	if snapshot.Protection.GlobalMaxInFlight == 0 {
+		snapshot.Protection.GlobalMaxInFlight = 1024
+	}
+	if snapshot.Protection.DefaultGroupMaxInFlight == 0 {
+		snapshot.Protection.DefaultGroupMaxInFlight = 256
+	}
+	if snapshot.Protection.DefaultGroupQueryTimeoutMS == 0 {
+		snapshot.Protection.DefaultGroupQueryTimeoutMS = 5000
+	}
+	if snapshot.Protection.OverloadAction == "" {
+		snapshot.Protection.OverloadAction = "servfail"
+	}
+	if snapshot.Protection.GlobalMaxInFlight < 1 || snapshot.Protection.GlobalMaxInFlight > 65535 {
+		return Snapshot{}, errors.New("protection.global_max_in_flight must be within 1..65535")
+	}
+	if snapshot.Protection.DefaultGroupMaxInFlight < 1 || snapshot.Protection.DefaultGroupMaxInFlight > snapshot.Protection.GlobalMaxInFlight {
+		return Snapshot{}, errors.New("protection.default_group_max_in_flight must be within 1..global_max_in_flight")
+	}
+	if snapshot.Protection.DefaultGroupQueryTimeoutMS < 1000 || snapshot.Protection.DefaultGroupQueryTimeoutMS > 30000 {
+		return Snapshot{}, errors.New("protection.default_group_query_timeout_ms must be within 1000..30000")
+	}
+	if action := snapshot.Protection.OverloadAction; action != "servfail" && action != "refused" && action != "drop" {
+		return Snapshot{}, errors.New("protection.overload_action must be servfail, refused or drop")
 	}
 	if len(snapshot.Groups) < 1 || len(snapshot.Groups) > 32 {
 		return Snapshot{}, errors.New("groups must contain 1..32 entries")
@@ -43,6 +70,12 @@ func canonicalSnapshotValues(snapshot Snapshot) (Snapshot, error) {
 		seen[group.ID] = struct{}{}
 		if group.Name == "" || len(group.Name) > 128 {
 			return Snapshot{}, fmt.Errorf("group %s name must contain 1..128 bytes", group.ID)
+		}
+		if group.MaxInFlight != nil && (*group.MaxInFlight < 1 || *group.MaxInFlight > 65535) {
+			return Snapshot{}, fmt.Errorf("group %s max_in_flight must be within 1..65535", group.ID)
+		}
+		if group.QueryTimeoutMS != nil && (*group.QueryTimeoutMS < 1000 || *group.QueryTimeoutMS > 30000) {
+			return Snapshot{}, fmt.Errorf("group %s query_timeout_ms must be within 1000..30000", group.ID)
 		}
 		if group.Cache.Size == 0 {
 			group.Cache.Size = defaultCacheSize

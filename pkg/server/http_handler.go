@@ -105,7 +105,7 @@ func (h *HttpHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	}
 	resp := h.dnsHandler.Handle(req.Context(), q, queryMeta, pool.PackBuffer)
 	if resp == nil {
-		w.WriteHeader(http.StatusInternalServerError)
+		w.WriteHeader(http.StatusServiceUnavailable)
 		return
 	}
 	defer pool.ReleaseBuf(resp)

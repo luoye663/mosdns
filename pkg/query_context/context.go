@@ -59,7 +59,26 @@ var contextUid atomic.Uint32
 var (
 	requestedUpstreamGroupKey = RegKey()
 	upstreamRuntimeMetaKey    = RegKey()
+	overloadActionKey         = RegKey()
 )
+
+type OverloadAction string
+
+const (
+	OverloadSERVFAIL OverloadAction = "servfail"
+	OverloadREFUSED  OverloadAction = "refused"
+	OverloadDrop     OverloadAction = "drop"
+)
+
+func SetOverloadAction(ctx *Context, action OverloadAction) {
+	ctx.StoreValue(overloadActionKey, action)
+}
+
+func OverloadActionFromContext(ctx *Context) (OverloadAction, bool) {
+	value, ok := ctx.GetValue(overloadActionKey)
+	action, valid := value.(OverloadAction)
+	return action, ok && valid
+}
 
 // UpstreamRuntimeMeta describes the runtime route selected for this query.
 type UpstreamRuntimeMeta struct {

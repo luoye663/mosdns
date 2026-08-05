@@ -10,7 +10,7 @@ func TestCanonicalRuntimeConfigAndPriorityLevels(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if config.Mode != "race" || config.Upstreams[0].Addr != "udp://8.8.8.8" || config.Upstreams[0].Weight != 1 {
+	if config.Mode != "race" || config.Upstreams[0].Addr != "udp://8.8.8.8" || config.Upstreams[0].Weight != 1 || config.Upstreams[0].TimeoutMS != defaultTimeoutMS {
 		t.Fatalf("canonical config = %+v", config)
 	}
 	levels := priorityLevels(config.Upstreams)
@@ -24,6 +24,8 @@ func TestCanonicalRuntimeConfigRejectsInvalidInput(t *testing.T) {
 		{Concurrent: 0, Upstreams: []Upstream{{Tag: "one", Addr: "1.1.1.1"}}},
 		{Mode: "unknown", Concurrent: 1, Upstreams: []Upstream{{Tag: "one", Addr: "1.1.1.1"}}},
 		{Concurrent: 1, Upstreams: []Upstream{{Tag: "one", Addr: "ftp://1.1.1.1"}}},
+		{Concurrent: 1, Upstreams: []Upstream{{Tag: "one", Addr: "1.1.1.1", TimeoutMS: 99}}},
+		{Concurrent: 1, Upstreams: []Upstream{{Tag: "one", Addr: "1.1.1.1", TimeoutMS: 4001}}},
 	} {
 		if _, err := CanonicalRuntimeConfig(config); err == nil {
 			t.Fatalf("invalid config accepted: %+v", config)
@@ -31,8 +33,25 @@ func TestCanonicalRuntimeConfigRejectsInvalidInput(t *testing.T) {
 	}
 }
 
-func TestCanonicalRuntimeConfigAllowsUnboundedUpstreamsAndSixteenConcurrent(t *testing.T) {
-	upstreams := make([]Upstream, 18)
+func TestWeightedTagsCanOrderEveryCandidate(t *testing.T) {
+	upstreams := []Upstream{{Tag: "one", Weight: 100}, {Tag: "two", Weight: 10}, {Tag: "three", Weight: 1}}
+	selected := weightedTags(upstreams, len(upstreams))
+	if len(selected) != len(upstreams) {
+		t.Fatalf("weighted selection = %v", selected)
+	}
+	seen := make(map[string]bool, len(selected))
+	for _, tag := range selected {
+		seen[tag] = true
+	}
+	for _, upstream := range upstreams {
+		if !seen[upstream.Tag] {
+			t.Fatalf("weighted selection omitted %q: %v", upstream.Tag, selected)
+		}
+	}
+}
+
+func TestCanonicalRuntimeConfigBoundsUpstreamsAndConcurrencyAtSixteen(t *testing.T) {
+	upstreams := make([]Upstream, 16)
 	for i := range upstreams {
 		upstreams[i] = Upstream{Tag: fmt.Sprintf("upstream_%d", i), Addr: "1.1.1.1", Weight: i + 1}
 	}
@@ -56,5 +75,9 @@ func TestCanonicalRuntimeConfigAllowsUnboundedUpstreamsAndSixteenConcurrent(t *t
 	}
 	if _, err := CanonicalRuntimeConfig(RuntimeConfig{Mode: "weighted", Concurrent: 17, Upstreams: upstreams}); err == nil {
 		t.Fatal("concurrent value above 16 was accepted")
+	}
+	tooMany := append(upstreams, Upstream{Tag: "upstream_16", Addr: "1.1.1.1"})
+	if _, err := CanonicalRuntimeConfig(RuntimeConfig{Mode: "weighted", Concurrent: 16, Upstreams: tooMany}); err == nil {
+		t.Fatal("seventeenth upstream was accepted")
 	}
 }
