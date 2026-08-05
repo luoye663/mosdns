@@ -3,6 +3,7 @@ package fastforward
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -173,6 +174,42 @@ func TestExchangeClampsConcurrencyToCandidateCount(t *testing.T) {
 	}
 	if got := only.calls.Load(); got != 1 {
 		t.Fatalf("single candidate queried %d times", got)
+	}
+}
+
+func TestExecBoundsConcurrencyButExecAllQueriesEveryCandidate(t *testing.T) {
+	const upstreamCount = 18
+	items := make([]struct {
+		tag string
+		u   upstream.Upstream
+	}, upstreamCount)
+	observed := make([]*observedUpstream, upstreamCount)
+	for i := range items {
+		observed[i] = new(observedUpstream)
+		items[i].tag = fmt.Sprintf("upstream_%d", i)
+		items[i].u = observed[i]
+	}
+
+	f := testForward(items...)
+	if err := f.Exec(context.Background(), testQueryContext()); err != nil {
+		t.Fatal(err)
+	}
+	var boundedCalls int32
+	for _, item := range observed {
+		boundedCalls += item.calls.Load()
+		item.calls.Store(0)
+	}
+	if boundedCalls != maxConcurrentQueries {
+		t.Fatalf("bounded forward queried %d upstreams, want %d", boundedCalls, maxConcurrentQueries)
+	}
+
+	if err := f.ExecAll(context.Background(), testQueryContext()); err != nil {
+		t.Fatal(err)
+	}
+	for i, item := range observed {
+		if calls := item.calls.Load(); calls != 1 {
+			t.Fatalf("all-upstream forward queried upstream %d %d times, want 1", i, calls)
+		}
 	}
 }
 

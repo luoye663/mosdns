@@ -1,6 +1,9 @@
 package dynamic_forward
 
-import "testing"
+import (
+	"fmt"
+	"testing"
+)
 
 func TestCanonicalRuntimeConfigAndPriorityLevels(t *testing.T) {
 	config, err := CanonicalRuntimeConfig(RuntimeConfig{Concurrent: 1, Upstreams: []Upstream{{Tag: "backup", Addr: "8.8.8.8", Priority: 200}, {Tag: "primary", Addr: "tcp://1.1.1.1", Priority: 100}}})
@@ -25,5 +28,33 @@ func TestCanonicalRuntimeConfigRejectsInvalidInput(t *testing.T) {
 		if _, err := CanonicalRuntimeConfig(config); err == nil {
 			t.Fatalf("invalid config accepted: %+v", config)
 		}
+	}
+}
+
+func TestCanonicalRuntimeConfigAllowsUnboundedUpstreamsAndSixteenConcurrent(t *testing.T) {
+	upstreams := make([]Upstream, 18)
+	for i := range upstreams {
+		upstreams[i] = Upstream{Tag: fmt.Sprintf("upstream_%d", i), Addr: "1.1.1.1", Weight: i + 1}
+	}
+	config, err := CanonicalRuntimeConfig(RuntimeConfig{Mode: "weighted", Concurrent: 16, Upstreams: upstreams})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(config.Upstreams) != len(upstreams) {
+		t.Fatalf("upstreams = %d, want %d", len(config.Upstreams), len(upstreams))
+	}
+	selected := weightedTags(config.Upstreams, config.Concurrent)
+	if len(selected) != 16 {
+		t.Fatalf("weighted selection = %d, want 16", len(selected))
+	}
+	seen := make(map[string]struct{}, len(selected))
+	for _, tag := range selected {
+		seen[tag] = struct{}{}
+	}
+	if len(seen) != len(selected) {
+		t.Fatalf("weighted selection contains duplicates: %v", selected)
+	}
+	if _, err := CanonicalRuntimeConfig(RuntimeConfig{Mode: "weighted", Concurrent: 17, Upstreams: upstreams}); err == nil {
+		t.Fatal("concurrent value above 16 was accepted")
 	}
 }

@@ -20,6 +20,8 @@ import (
 
 var tagPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
 
+const maxConcurrentQueries = 16
+
 type Upstream struct {
 	Tag      string `json:"tag" yaml:"tag"`
 	Addr     string `json:"addr" yaml:"addr"`
@@ -35,8 +37,8 @@ type RuntimeConfig struct {
 }
 
 func CanonicalRuntimeConfig(config RuntimeConfig) (RuntimeConfig, error) {
-	if config.Concurrent < 1 || config.Concurrent > 3 {
-		return RuntimeConfig{}, errors.New("concurrent must be within 1..3")
+	if config.Concurrent < 1 || config.Concurrent > maxConcurrentQueries {
+		return RuntimeConfig{}, errors.New("concurrent must be within 1..16")
 	}
 	if config.Mode == "" {
 		config.Mode = "race"
@@ -44,8 +46,8 @@ func CanonicalRuntimeConfig(config RuntimeConfig) (RuntimeConfig, error) {
 	if config.Mode != "race" && config.Mode != "weighted" && config.Mode != "failover" {
 		return RuntimeConfig{}, errors.New("mode must be race, weighted or failover")
 	}
-	if len(config.Upstreams) == 0 || len(config.Upstreams) > 16 {
-		return RuntimeConfig{}, errors.New("upstreams must contain 1..16 entries")
+	if len(config.Upstreams) == 0 {
+		return RuntimeConfig{}, errors.New("upstreams must contain at least one entry")
 	}
 	config.Socks5 = strings.TrimSpace(config.Socks5)
 	config.Upstreams = append([]Upstream(nil), config.Upstreams...)
@@ -119,17 +121,22 @@ func (r *Runtime) Exec(ctx context.Context, qCtx *query_context.Context) error {
 	case "failover":
 		var lastErr error
 		for _, level := range r.levels {
-			if err := r.forward.ExecWithTags(ctx, qCtx, level); err != nil {
-				lastErr = err
-				continue
-			}
-			if response := qCtx.R(); response == nil || response.Rcode != dns.RcodeServerFailure {
-				return nil
+			candidates := append([]string(nil), level...)
+			rand.Shuffle(len(candidates), func(i, j int) { candidates[i], candidates[j] = candidates[j], candidates[i] })
+			for start := 0; start < len(candidates); start += r.count {
+				end := min(start+r.count, len(candidates))
+				if err := r.forward.ExecWithTags(ctx, qCtx, candidates[start:end]); err != nil {
+					lastErr = err
+					continue
+				}
+				if response := qCtx.R(); response == nil || response.Rcode != dns.RcodeServerFailure {
+					return nil
+				}
 			}
 		}
 		return lastErr
 	default:
-		return r.forward.Exec(ctx, qCtx)
+		return r.forward.ExecAll(ctx, qCtx)
 	}
 }
 

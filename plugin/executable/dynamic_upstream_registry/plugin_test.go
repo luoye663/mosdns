@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -287,6 +288,71 @@ func TestForwardModes(t *testing.T) {
 				t.Fatalf("answer = %s", got)
 			}
 		})
+	}
+}
+
+func TestRaceQueriesAllUpstreamsBeyondBoundedConcurrency(t *testing.T) {
+	const upstreamCount = 18
+	var arrived atomic.Int32
+	allArrived := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(allArrived) }) }
+	timer := time.AfterFunc(2*time.Second, release)
+	t.Cleanup(func() { timer.Stop(); release() })
+
+	g := group("default", "Default", "udp://127.0.0.1:53")
+	g.Upstreams = make([]dynamic_forward.Upstream, 0, upstreamCount)
+	servers := make([]*testDNSServer, 0, upstreamCount)
+	for i := 0; i < upstreamCount; i++ {
+		server := startDNSServer(t, "192.0.2.10", dns.RcodeSuccess, func(*dns.Msg) {
+			if arrived.Add(1) == upstreamCount {
+				release()
+			}
+			<-allArrived
+		})
+		servers = append(servers, server)
+		g.Upstreams = append(g.Upstreams, dynamic_forward.Upstream{Tag: fmt.Sprintf("race_%d", i), Addr: server.addr})
+	}
+	p, _ := newTestPlugin(t, snapshot(1, g))
+	if err := p.Exec(t.Context(), query("race-all.example.")); err != nil {
+		t.Fatal(err)
+	}
+	for i, server := range servers {
+		if requests := server.requests.Load(); requests != 1 {
+			t.Fatalf("race upstream %d received %d requests, want 1", i, requests)
+		}
+	}
+}
+
+func TestFailoverExhaustsPriorityLevelInBatches(t *testing.T) {
+	const primaryCount = 17
+	g := group("default", "Default", "udp://127.0.0.1:53")
+	g.Mode = "failover"
+	g.Concurrent = 16
+	g.Upstreams = make([]dynamic_forward.Upstream, 0, primaryCount+1)
+	primaries := make([]*testDNSServer, 0, primaryCount)
+	for i := 0; i < primaryCount; i++ {
+		server := startDNSServer(t, "", dns.RcodeServerFailure, nil)
+		primaries = append(primaries, server)
+		g.Upstreams = append(g.Upstreams, dynamic_forward.Upstream{Tag: fmt.Sprintf("primary_%d", i), Addr: server.addr, Priority: 1})
+	}
+	backup := startDNSServer(t, "192.0.2.20", dns.RcodeSuccess, nil)
+	g.Upstreams = append(g.Upstreams, dynamic_forward.Upstream{Tag: "backup", Addr: backup.addr, Priority: 2})
+	p, _ := newTestPlugin(t, snapshot(1, g))
+	qCtx := query("failover-batches.example.")
+	if err := p.Exec(t.Context(), qCtx); err != nil {
+		t.Fatal(err)
+	}
+	if got := answerIP(t, qCtx); got != "192.0.2.20" {
+		t.Fatalf("answer = %s", got)
+	}
+	for i, server := range primaries {
+		if requests := server.requests.Load(); requests != 1 {
+			t.Fatalf("primary upstream %d received %d requests, want 1", i, requests)
+		}
+	}
+	if requests := backup.requests.Load(); requests != 1 {
+		t.Fatalf("backup received %d requests, want 1", requests)
 	}
 }
 
