@@ -129,12 +129,13 @@ func applySnapshot(t *testing.T, p *Plugin, value Snapshot) *httptest.ResponseRe
 
 func TestCanonicalSnapshotValidation(t *testing.T) {
 	validGroup := group("default", "Default", "udp://127.0.0.1:53")
+	validGroup.Bootstrap = " 223.5.5.5:53 "
 	valid := snapshot(1, validGroup)
 	canonical, err := canonicalWithoutRuntime(valid)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if canonical.Groups[0].Mode != "race" || canonical.Cache.Negative.TTL != 30 {
+	if canonical.Groups[0].Mode != "race" || canonical.Groups[0].Bootstrap != "223.5.5.5:53" || canonical.Groups[0].BootstrapVer != 4 || canonical.Cache.Negative.TTL != 30 {
 		t.Fatalf("canonical = %+v", canonical)
 	}
 	if canonical.Protection.GlobalMaxInFlight != 1024 || canonical.Protection.DefaultGroupMaxInFlight != 256 || canonical.Protection.DefaultGroupQueryTimeoutMS != 5000 || canonical.Protection.OverloadAction != "servfail" {
@@ -153,18 +154,20 @@ func TestCanonicalSnapshotValidation(t *testing.T) {
 		t.Fatalf("group override above global should remain valid: %v", err)
 	}
 	for name, mutate := range map[string]func(*Snapshot){
-		"schema":           func(s *Snapshot) { s.SchemaVersion = 0 },
-		"version":          func(s *Snapshot) { s.Version = 0 },
-		"id":               func(s *Snapshot) { s.Groups[0].ID = "Invalid" },
-		"missing default":  func(s *Snapshot) { s.DefaultGroupID = "missing" },
-		"disabled default": func(s *Snapshot) { s.Groups[0].Enabled = false },
-		"cache total":      func(s *Snapshot) { s.Groups[0].Cache.Size = maximumCacheEntries + 1 },
-		"ecs":              func(s *Snapshot) { s.Groups[0].ECS = dynamic_ecs.Config{Mode: "fixed_subnet"} },
-		"mode":             func(s *Snapshot) { s.Groups[0].Mode = "invalid" },
-		"global limit":     func(s *Snapshot) { s.Protection.GlobalMaxInFlight = 65536 },
-		"group default":    func(s *Snapshot) { s.Protection.DefaultGroupMaxInFlight = 1025 },
-		"group timeout":    func(s *Snapshot) { s.Protection.DefaultGroupQueryTimeoutMS = 30001 },
-		"overload action":  func(s *Snapshot) { s.Protection.OverloadAction = "invalid" },
+		"schema":            func(s *Snapshot) { s.SchemaVersion = 0 },
+		"version":           func(s *Snapshot) { s.Version = 0 },
+		"id":                func(s *Snapshot) { s.Groups[0].ID = "Invalid" },
+		"missing default":   func(s *Snapshot) { s.DefaultGroupID = "missing" },
+		"disabled default":  func(s *Snapshot) { s.Groups[0].Enabled = false },
+		"cache total":       func(s *Snapshot) { s.Groups[0].Cache.Size = maximumCacheEntries + 1 },
+		"ecs":               func(s *Snapshot) { s.Groups[0].ECS = dynamic_ecs.Config{Mode: "fixed_subnet"} },
+		"mode":              func(s *Snapshot) { s.Groups[0].Mode = "invalid" },
+		"bootstrap":         func(s *Snapshot) { s.Groups[0].Bootstrap = "dns.example" },
+		"bootstrap version": func(s *Snapshot) { s.Groups[0].BootstrapVer = 5 },
+		"global limit":      func(s *Snapshot) { s.Protection.GlobalMaxInFlight = 65536 },
+		"group default":     func(s *Snapshot) { s.Protection.DefaultGroupMaxInFlight = 1025 },
+		"group timeout":     func(s *Snapshot) { s.Protection.DefaultGroupQueryTimeoutMS = 30001 },
+		"overload action":   func(s *Snapshot) { s.Protection.OverloadAction = "invalid" },
 	} {
 		t.Run(name, func(t *testing.T) {
 			value := valid

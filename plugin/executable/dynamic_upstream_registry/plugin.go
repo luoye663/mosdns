@@ -65,6 +65,8 @@ type Group struct {
 	Mode           string                     `json:"mode" yaml:"mode"`
 	Concurrent     int                        `json:"concurrent" yaml:"concurrent"`
 	Socks5         string                     `json:"socks5,omitempty" yaml:"socks5"`
+	Bootstrap      string                     `json:"bootstrap,omitempty" yaml:"bootstrap"`
+	BootstrapVer   int                        `json:"bootstrap_version" yaml:"bootstrap_version"`
 	MaxInFlight    *int                       `json:"max_in_flight,omitempty" yaml:"max_in_flight"`
 	QueryTimeoutMS *int                       `json:"query_timeout_ms,omitempty" yaml:"query_timeout_ms"`
 	Upstreams      []dynamic_forward.Upstream `json:"upstreams" yaml:"upstreams"`
@@ -234,7 +236,7 @@ func (p *Plugin) buildState(snapshot Snapshot, loadCacheDumps bool) (*runtimeSta
 	}
 	state := &runtimeState{snapshot: canonicalSnapshot, groups: make(map[string]*runtimeGroup, len(canonicalSnapshot.Groups)), done: make(chan struct{})}
 	for _, config := range canonicalSnapshot.Groups {
-		forward, err := dynamic_forward.NewRuntime(config.Mode, config.Concurrent, config.Socks5, config.Upstreams, p.logger, p.metricsTag+"_"+config.ID)
+		forward, err := dynamic_forward.NewRuntime(dynamic_forward.RuntimeConfig{Mode: config.Mode, Concurrent: config.Concurrent, Socks5: config.Socks5, Bootstrap: config.Bootstrap, BootstrapVer: config.BootstrapVer, Upstreams: config.Upstreams}, p.logger, p.metricsTag+"_"+config.ID)
 		if err != nil {
 			state.retire()
 			return nil, fmt.Errorf("group %s forward: %w", config.ID, err)

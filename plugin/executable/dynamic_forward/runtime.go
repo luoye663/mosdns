@@ -38,10 +38,12 @@ type Upstream struct {
 }
 
 type RuntimeConfig struct {
-	Mode       string
-	Concurrent int
-	Socks5     string
-	Upstreams  []Upstream
+	Mode         string
+	Concurrent   int
+	Socks5       string
+	Bootstrap    string
+	BootstrapVer int
+	Upstreams    []Upstream
 }
 
 func CanonicalRuntimeConfig(config RuntimeConfig) (RuntimeConfig, error) {
@@ -58,6 +60,22 @@ func CanonicalRuntimeConfig(config RuntimeConfig) (RuntimeConfig, error) {
 		return RuntimeConfig{}, errors.New("upstreams must contain 1..16 entries")
 	}
 	config.Socks5 = strings.TrimSpace(config.Socks5)
+	config.Bootstrap = strings.TrimSpace(config.Bootstrap)
+	if config.Bootstrap != "" {
+		if addr, err := netip.ParseAddr(config.Bootstrap); err == nil {
+			config.Bootstrap = addr.String()
+		} else if addrPort, err := netip.ParseAddrPort(config.Bootstrap); err == nil && addrPort.Port() != 0 {
+			config.Bootstrap = addrPort.String()
+		} else {
+			return RuntimeConfig{}, errors.New("bootstrap must be an IP address with an optional non-zero port")
+		}
+	}
+	if config.BootstrapVer == 0 {
+		config.BootstrapVer = 4
+	}
+	if config.BootstrapVer != 4 && config.BootstrapVer != 6 {
+		return RuntimeConfig{}, errors.New("bootstrap_version must be 4 or 6")
+	}
 	config.Upstreams = append([]Upstream(nil), config.Upstreams...)
 	seen := make(map[string]struct{}, len(config.Upstreams))
 	for i := range config.Upstreams {
@@ -116,14 +134,14 @@ type Runtime struct {
 	levels  [][]string
 }
 
-func NewRuntime(mode string, concurrent int, socks5 string, upstreams []Upstream, logger *zap.Logger, metricsTag string) (*Runtime, error) {
-	config, err := CanonicalRuntimeConfig(RuntimeConfig{Mode: mode, Concurrent: concurrent, Socks5: socks5, Upstreams: upstreams})
+func NewRuntime(runtimeConfig RuntimeConfig, logger *zap.Logger, metricsTag string) (*Runtime, error) {
+	config, err := CanonicalRuntimeConfig(runtimeConfig)
 	if err != nil {
 		return nil, err
 	}
-	forward, err := fastforward.NewForward(&fastforward.Args{Concurrent: config.Concurrent, Socks5: config.Socks5, Upstreams: forwardUpstreams(config.Upstreams)}, fastforward.Opts{Logger: logger, MetricsTag: metricsTag})
+	forward, err := fastforward.NewForward(&fastforward.Args{Concurrent: config.Concurrent, Socks5: config.Socks5, Bootstrap: config.Bootstrap, BootstrapVer: config.BootstrapVer, Upstreams: forwardUpstreams(config.Upstreams)}, fastforward.Opts{Logger: logger, MetricsTag: metricsTag})
 	if err != nil {
-		return nil, errors.New("invalid upstream configuration")
+		return nil, fmt.Errorf("invalid upstream configuration: %w", err)
 	}
 	return &Runtime{forward: forward, mode: config.Mode, count: config.Concurrent, items: config.Upstreams, levels: priorityLevels(config.Upstreams)}, nil
 }

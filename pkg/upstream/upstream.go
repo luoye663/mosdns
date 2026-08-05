@@ -216,25 +216,26 @@ func NewUpstream(addr string, opt Opt) (_ Upstream, err error) {
 			return nil, err
 		}
 
-		// Socks5 enabled.
+		var contextDialer proxy.ContextDialer
 		if s5Addr := opt.Socks5; len(s5Addr) > 0 {
 			socks5Dialer, err := proxy.SOCKS5("tcp", s5Addr, nil, dialer)
 			if err != nil {
 				return nil, fmt.Errorf("failed to init socks5 dialer: %w", err)
 			}
-
-			contextDialer := socks5Dialer.(proxy.ContextDialer)
-			dialAddr := net.JoinHostPort(host, strconv.Itoa(int(port)))
-			return func(ctx context.Context) (net.Conn, error) {
-				return contextDialer.DialContext(ctx, "tcp", dialAddr)
-			}, nil
+			contextDialer = socks5Dialer.(proxy.ContextDialer)
+		}
+		dialContext := func(ctx context.Context, address string) (net.Conn, error) {
+			if contextDialer != nil {
+				return contextDialer.DialContext(ctx, "tcp", address)
+			}
+			return dialer.DialContext(ctx, "tcp", address)
 		}
 
 		if _, err := netip.ParseAddr(host); err == nil {
 			// Host is an ip addr. No need to resolve it.
 			dialAddr := net.JoinHostPort(host, strconv.Itoa(int(port)))
 			return func(ctx context.Context) (net.Conn, error) {
-				return dialer.DialContext(ctx, "tcp", dialAddr)
+				return dialContext(ctx, dialAddr)
 			}, nil
 		} else {
 			if dialAddrMustBeIp {
@@ -253,13 +254,13 @@ func NewUpstream(addr string, opt Opt) (_ Upstream, err error) {
 					if err != nil {
 						return nil, fmt.Errorf("bootstrap failed, %w", err)
 					}
-					return dialer.DialContext(ctx, "tcp", dialAddr)
+					return dialContext(ctx, dialAddr)
 				}, nil
 			} else {
 				// Bootstrap disabled.
 				dialAddr := net.JoinHostPort(host, strconv.Itoa(int(port)))
 				return func(ctx context.Context) (net.Conn, error) {
-					return dialer.DialContext(ctx, "tcp", dialAddr)
+					return dialContext(ctx, dialAddr)
 				}, nil
 			}
 		}
@@ -275,17 +276,17 @@ func NewUpstream(addr string, opt Opt) (_ Upstream, err error) {
 	case "", "udp":
 		const defaultPort = 53
 		const maxConcurrentQueryPreConn = 4096 // Protocol limit is 65535.
-		host, port, err := parseDialAddr(addrUrlHost, opt.DialAddr, defaultPort)
+		resolveAddr, err := newUdpAddrResolveFunc(defaultPort)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("failed to init udp addr resolver, %w", err)
 		}
-		if _, err := netip.ParseAddr(host); err != nil {
-			return nil, fmt.Errorf("addr must be an ip address, %w", err)
-		}
-		dialAddr := joinPort(host, port)
 
 		dialUdpPipeline := func(ctx context.Context) (transport.DnsConn, error) {
-			c, err := dialer.DialContext(ctx, "udp", dialAddr)
+			addr, err := resolveAddr(ctx)
+			if err != nil {
+				return nil, err
+			}
+			c, err := dialer.DialContext(ctx, "udp", addr.String())
 			if err != nil {
 				return nil, err
 			}
@@ -297,7 +298,11 @@ func NewUpstream(addr string, opt Opt) (_ Upstream, err error) {
 			return transport.NewDnsConn(to, wrapConn(c, opt.EventObserver)), nil
 		}
 		dialTcpNetConn := func(ctx context.Context) (transport.NetConn, error) {
-			c, err := dialer.DialContext(ctx, "tcp", dialAddr)
+			addr, err := resolveAddr(ctx)
+			if err != nil {
+				return nil, err
+			}
+			c, err := dialer.DialContext(ctx, "tcp", addr.String())
 			if err != nil {
 				return nil, err
 			}
@@ -314,7 +319,7 @@ func NewUpstream(addr string, opt Opt) (_ Upstream, err error) {
 		}, nil
 	case "tcp":
 		const defaultPort = 53
-		tcpDialer, err := newTcpDialer(true, defaultPort)
+		tcpDialer, err := newTcpDialer(false, defaultPort)
 		if err != nil {
 			return nil, fmt.Errorf("failed to init tcp dialer, %w", err)
 		}

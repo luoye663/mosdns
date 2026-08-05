@@ -26,6 +26,7 @@ import (
 	"fmt"
 	"net"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -146,6 +147,40 @@ func Test_fastUpstream(t *testing.T) {
 			}
 		}
 
+	}
+}
+
+func TestHostnameUpstreamsUseBootstrap(t *testing.T) {
+	var bootstrapQueries atomic.Int32
+	bootstrapAddr, shutdownBootstrap := newUDPTestServer(t, dns.HandlerFunc(func(w dns.ResponseWriter, q *dns.Msg) {
+		bootstrapQueries.Add(1)
+		response := new(dns.Msg)
+		response.SetReply(q)
+		response.Answer = []dns.RR{&dns.A{Hdr: dns.RR_Header{Name: q.Question[0].Name, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 60}, A: net.ParseIP("127.0.0.1")}}
+		_ = w.WriteMsg(response)
+	}))
+	defer shutdownBootstrap()
+
+	for _, scheme := range []string{"udp", "tcp", "tls"} {
+		t.Run(scheme, func(t *testing.T) {
+			addr, shutdownTarget := m[scheme](t, &vServer{})
+			defer shutdownTarget()
+			_, port, err := net.SplitHostPort(addr)
+			if err != nil {
+				t.Fatal(err)
+			}
+			u, err := NewUpstream(scheme+"://bootstrap-target.invalid:"+port, Opt{Bootstrap: bootstrapAddr, BootstrapVer: 4, TLSConfig: &tls.Config{InsecureSkipVerify: true}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer u.Close()
+			if err := testUpstream(u); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+	if bootstrapQueries.Load() < 3 {
+		t.Fatalf("bootstrap received %d queries, want at least one per protocol", bootstrapQueries.Load())
 	}
 }
 

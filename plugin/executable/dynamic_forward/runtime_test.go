@@ -33,6 +33,51 @@ func TestCanonicalRuntimeConfigRejectsInvalidInput(t *testing.T) {
 	}
 }
 
+func TestCanonicalRuntimeConfigBootstrap(t *testing.T) {
+	base := RuntimeConfig{Concurrent: 1, Upstreams: []Upstream{{Tag: "one", Addr: "tls://resolver.example"}}}
+	for _, tc := range []struct {
+		name      string
+		bootstrap string
+		version   int
+		want      string
+		wantVer   int
+	}{
+		{name: "default version", bootstrap: " 1.1.1.1 ", want: "1.1.1.1", wantVer: 4},
+		{name: "ipv4 with port", bootstrap: "223.5.5.5:5353", version: 4, want: "223.5.5.5:5353", wantVer: 4},
+		{name: "ipv6", bootstrap: "2400:3200::1", version: 6, want: "2400:3200::1", wantVer: 6},
+		{name: "ipv6 with port", bootstrap: "[2400:3200::1]:5353", version: 6, want: "[2400:3200::1]:5353", wantVer: 6},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			config := base
+			config.Bootstrap, config.BootstrapVer = tc.bootstrap, tc.version
+			canonical, err := CanonicalRuntimeConfig(config)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if canonical.Bootstrap != tc.want || canonical.BootstrapVer != tc.wantVer {
+				t.Fatalf("bootstrap = %q/%d, want %q/%d", canonical.Bootstrap, canonical.BootstrapVer, tc.want, tc.wantVer)
+			}
+		})
+	}
+
+	for _, tc := range []struct {
+		bootstrap string
+		version   int
+	}{
+		{bootstrap: "dns.example"},
+		{bootstrap: "https://1.1.1.1"},
+		{bootstrap: "1.1.1.1:0"},
+		{bootstrap: "1.1.1.1:65536"},
+		{bootstrap: "1.1.1.1", version: 5},
+	} {
+		config := base
+		config.Bootstrap, config.BootstrapVer = tc.bootstrap, tc.version
+		if _, err := CanonicalRuntimeConfig(config); err == nil {
+			t.Fatalf("invalid bootstrap accepted: %q/%d", tc.bootstrap, tc.version)
+		}
+	}
+}
+
 func TestWeightedTagsCanOrderEveryCandidate(t *testing.T) {
 	upstreams := []Upstream{{Tag: "one", Weight: 100}, {Tag: "two", Weight: 10}, {Tag: "three", Weight: 1}}
 	selected := weightedTags(upstreams, len(upstreams))

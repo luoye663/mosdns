@@ -60,7 +60,7 @@ func canonicalSnapshotValues(snapshot Snapshot) (Snapshot, error) {
 	totalCacheSize, defaultEnabled := 0, false
 	for i := range snapshot.Groups {
 		group := &snapshot.Groups[i]
-		group.ID, group.Name, group.Socks5 = strings.TrimSpace(group.ID), strings.TrimSpace(group.Name), strings.TrimSpace(group.Socks5)
+		group.ID, group.Name, group.Socks5, group.Bootstrap = strings.TrimSpace(group.ID), strings.TrimSpace(group.Name), strings.TrimSpace(group.Socks5), strings.TrimSpace(group.Bootstrap)
 		if !groupIDPattern.MatchString(group.ID) {
 			return Snapshot{}, fmt.Errorf("group %d has an invalid id", i+1)
 		}
@@ -92,11 +92,11 @@ func canonicalSnapshotValues(snapshot Snapshot) (Snapshot, error) {
 			return Snapshot{}, fmt.Errorf("group %s ECS: %w", group.ID, err)
 		}
 		group.ECS = ecs
-		forward, err := dynamic_forward.CanonicalRuntimeConfig(dynamic_forward.RuntimeConfig{Mode: group.Mode, Concurrent: group.Concurrent, Socks5: group.Socks5, Upstreams: group.Upstreams})
+		forward, err := dynamic_forward.CanonicalRuntimeConfig(dynamic_forward.RuntimeConfig{Mode: group.Mode, Concurrent: group.Concurrent, Socks5: group.Socks5, Bootstrap: group.Bootstrap, BootstrapVer: group.BootstrapVer, Upstreams: group.Upstreams})
 		if err != nil {
 			return Snapshot{}, fmt.Errorf("group %s forward: %w", group.ID, err)
 		}
-		group.Mode, group.Concurrent, group.Socks5, group.Upstreams = forward.Mode, forward.Concurrent, forward.Socks5, forward.Upstreams
+		group.Mode, group.Concurrent, group.Socks5, group.Bootstrap, group.BootstrapVer, group.Upstreams = forward.Mode, forward.Concurrent, forward.Socks5, forward.Bootstrap, forward.BootstrapVer, forward.Upstreams
 		if group.ID == snapshot.DefaultGroupID {
 			defaultEnabled = group.Enabled
 		}
