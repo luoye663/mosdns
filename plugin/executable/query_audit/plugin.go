@@ -314,6 +314,14 @@ func (p *Plugin) buildEvent(qCtx *query_context.Context, started time.Time, exec
 	}
 	if execErr != nil {
 		event.ErrorCode = "DNS_PROCESSING_ERROR"
+		if overload, ok := query_context.OverloadInfoFromContext(qCtx); ok {
+			switch overload.Scope {
+			case query_context.OverloadScopeGlobal:
+				event.ErrorCode = "DNS_CONCURRENCY_LIMIT_GLOBAL"
+			case query_context.OverloadScopeGroup:
+				event.ErrorCode = "DNS_CONCURRENCY_LIMIT_GROUP"
+			}
+		}
 		if p.includeErrors {
 			event.ErrorText = truncate(execErr.Error(), p.maxErrorBytes)
 		}

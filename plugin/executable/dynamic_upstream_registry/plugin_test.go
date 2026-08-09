@@ -200,6 +200,9 @@ func TestConcurrencyLimitsAndOverloadAction(t *testing.T) {
 	if action, ok := query_context.OverloadActionFromContext(qCtx); !ok || action != query_context.OverloadREFUSED {
 		t.Fatalf("global overload action = %q ok=%t", action, ok)
 	}
+	if info, ok := query_context.OverloadInfoFromContext(qCtx); !ok || info.Scope != query_context.OverloadScopeGlobal || info.GroupID != "" || info.Limit != 1 {
+		t.Fatalf("global overload info = %+v ok=%t", info, ok)
+	}
 	p.globalInFlight.Store(0)
 
 	state := p.current.Load()
@@ -210,6 +213,43 @@ func TestConcurrencyLimitsAndOverloadAction(t *testing.T) {
 	}
 	if action, ok := query_context.OverloadActionFromContext(qCtx); !ok || action != query_context.OverloadREFUSED {
 		t.Fatalf("group overload action = %q ok=%t", action, ok)
+	}
+	if info, ok := query_context.OverloadInfoFromContext(qCtx); !ok || info.Scope != query_context.OverloadScopeGroup || info.GroupID != "default" || info.Limit != 1 {
+		t.Fatalf("group overload info = %+v ok=%t", info, ok)
+	}
+}
+
+func TestRuntimeStatusReportsLiveCountersAndEffectiveLimits(t *testing.T) {
+	server := startDNSServer(t, "192.0.2.42", dns.RcodeSuccess, nil)
+	first := group("default", "Default", server.addr)
+	second := group("disabled", "Disabled", server.addr)
+	second.Enabled = false
+	override := 7
+	second.MaxInFlight = &override
+	configured := snapshot(3, first, second)
+	configured.Protection = ProtectionConfig{GlobalMaxInFlight: 32, DefaultGroupMaxInFlight: 16, DefaultGroupQueryTimeoutMS: 5000, OverloadAction: "servfail"}
+	p, _ := newTestPlugin(t, configured)
+	p.globalInFlight.Store(5)
+	p.current.Load().groups["default"].inFlight.Store(3)
+	p.current.Load().groups["disabled"].inFlight.Store(2)
+
+	recorder := httptest.NewRecorder()
+	p.router().ServeHTTP(recorder, authorizedRequest(http.MethodGet, "/runtime-status", nil))
+	if recorder.Code != http.StatusOK || recorder.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("runtime status code=%d cache-control=%q body=%s", recorder.Code, recorder.Header().Get("Cache-Control"), recorder.Body.String())
+	}
+	var status RuntimeStatus
+	if err := json.NewDecoder(recorder.Body).Decode(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status.RegistryVersion != 3 || status.Global != (RuntimeConcurrency{InFlight: 5, Limit: 32}) || len(status.Groups) != 2 {
+		t.Fatalf("runtime status = %+v", status)
+	}
+	if status.Groups[0].ID != "default" || status.Groups[0].InFlight != 3 || status.Groups[0].Limit != 16 || !status.Groups[0].Enabled {
+		t.Fatalf("default runtime status = %+v", status.Groups[0])
+	}
+	if status.Groups[1].ID != "disabled" || status.Groups[1].InFlight != 2 || status.Groups[1].Limit != 7 || status.Groups[1].Enabled {
+		t.Fatalf("disabled runtime status = %+v", status.Groups[1])
 	}
 }
 
@@ -226,6 +266,12 @@ func TestGroupQueryTimeoutCapsAllUpstreamWork(t *testing.T) {
 	}
 	if elapsed := time.Since(started); elapsed < 900*time.Millisecond || elapsed > 1500*time.Millisecond {
 		t.Fatalf("group timeout elapsed = %s", elapsed)
+	}
+	if global := p.globalInFlight.Load(); global != 0 {
+		t.Fatalf("global in-flight after timeout = %d", global)
+	}
+	if group := p.current.Load().groups["default"].inFlight.Load(); group != 0 {
+		t.Fatalf("group in-flight after timeout = %d", group)
 	}
 }
 

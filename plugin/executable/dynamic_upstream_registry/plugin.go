@@ -156,6 +156,25 @@ type protectionMetrics struct {
 	timeouts  *prometheus.CounterVec
 }
 
+type RuntimeConcurrency struct {
+	InFlight int64 `json:"in_flight"`
+	Limit    int   `json:"limit"`
+}
+
+type GroupRuntimeStatus struct {
+	ID       string `json:"id"`
+	Name     string `json:"name"`
+	Enabled  bool   `json:"enabled"`
+	InFlight int64  `json:"in_flight"`
+	Limit    int    `json:"limit"`
+}
+
+type RuntimeStatus struct {
+	RegistryVersion uint64               `json:"registry_version"`
+	Global          RuntimeConcurrency   `json:"global"`
+	Groups          []GroupRuntimeStatus `json:"groups"`
+}
+
 var _ sequence.Executable = (*Plugin)(nil)
 var _ io.Closer = (*Plugin)(nil)
 
@@ -267,12 +286,15 @@ func (p *Plugin) updateLimitMetrics(snapshot Snapshot) {
 	p.metrics.limit.Reset()
 	p.metrics.limit.WithLabelValues("global", "").Set(float64(snapshot.Protection.GlobalMaxInFlight))
 	for _, config := range snapshot.Groups {
-		limit := snapshot.Protection.DefaultGroupMaxInFlight
-		if config.MaxInFlight != nil {
-			limit = *config.MaxInFlight
-		}
-		p.metrics.limit.WithLabelValues("group", config.ID).Set(float64(limit))
+		p.metrics.limit.WithLabelValues("group", config.ID).Set(float64(effectiveGroupLimit(snapshot.Protection, config)))
 	}
+}
+
+func effectiveGroupLimit(protection ProtectionConfig, group Group) int {
+	if group.MaxInFlight != nil {
+		return *group.MaxInFlight
+	}
+	return protection.DefaultGroupMaxInFlight
 }
 
 // canonicalWithoutRuntime validates values without opening network transports.
@@ -321,8 +343,16 @@ func tryAcquire(counter *atomic.Int64, limit int) bool {
 	}
 }
 
-func setOverloadAction(qCtx *query_context.Context, action string) {
+func setOverload(qCtx *query_context.Context, action string, info query_context.OverloadInfo) {
 	query_context.SetOverloadAction(qCtx, query_context.OverloadAction(action))
+	query_context.SetOverloadInfo(qCtx, info)
+}
+
+func overloadError(info query_context.OverloadInfo) error {
+	if info.Scope == query_context.OverloadScopeGroup {
+		return fmt.Errorf("%w: scope=group group=%s limit=%d", errOverloaded, info.GroupID, info.Limit)
+	}
+	return fmt.Errorf("%w: scope=global limit=%d", errOverloaded, info.Limit)
 }
 
 func (p *Plugin) Exec(ctx context.Context, qCtx *query_context.Context) error {
@@ -332,9 +362,10 @@ func (p *Plugin) Exec(ctx context.Context, qCtx *query_context.Context) error {
 	}
 	defer p.release(state)
 	if !tryAcquire(&p.globalInFlight, state.snapshot.Protection.GlobalMaxInFlight) {
-		setOverloadAction(qCtx, state.snapshot.Protection.OverloadAction)
+		info := query_context.OverloadInfo{Scope: query_context.OverloadScopeGlobal, Limit: state.snapshot.Protection.GlobalMaxInFlight}
+		setOverload(qCtx, state.snapshot.Protection.OverloadAction, info)
 		p.metrics.admission.WithLabelValues("global", "", "rejected", state.snapshot.Protection.OverloadAction).Inc()
-		return errOverloaded
+		return overloadError(info)
 	}
 	p.metrics.admission.WithLabelValues("global", "", "accepted", "").Inc()
 	p.metrics.inFlight.WithLabelValues("global", "").Inc()
@@ -367,25 +398,24 @@ func (p *Plugin) Exec(ctx context.Context, qCtx *query_context.Context) error {
 	}
 	groupCtx, cancel := context.WithTimeout(ctx, time.Duration(queryTimeoutMS)*time.Millisecond)
 	defer cancel()
-	groupLimit := state.snapshot.Protection.DefaultGroupMaxInFlight
-	if group.config.MaxInFlight != nil {
-		groupLimit = *group.config.MaxInFlight
-	}
+	groupLimit := effectiveGroupLimit(state.snapshot.Protection, group.config)
 	limitedForward := func(forwardCtx context.Context, forwardQuery *query_context.Context) error {
 		if forwardQuery != qCtx {
 			if !tryAcquire(&p.globalInFlight, state.snapshot.Protection.GlobalMaxInFlight) {
-				setOverloadAction(forwardQuery, state.snapshot.Protection.OverloadAction)
+				info := query_context.OverloadInfo{Scope: query_context.OverloadScopeGlobal, Limit: state.snapshot.Protection.GlobalMaxInFlight}
+				setOverload(forwardQuery, state.snapshot.Protection.OverloadAction, info)
 				p.metrics.admission.WithLabelValues("global", "", "rejected", state.snapshot.Protection.OverloadAction).Inc()
-				return errOverloaded
+				return overloadError(info)
 			}
 			p.metrics.admission.WithLabelValues("global", "", "accepted", "").Inc()
 			p.metrics.inFlight.WithLabelValues("global", "").Inc()
 			defer func() { p.globalInFlight.Add(-1); p.metrics.inFlight.WithLabelValues("global", "").Dec() }()
 		}
 		if !tryAcquire(group.inFlight, groupLimit) {
-			setOverloadAction(forwardQuery, state.snapshot.Protection.OverloadAction)
+			info := query_context.OverloadInfo{Scope: query_context.OverloadScopeGroup, GroupID: groupID, Limit: groupLimit}
+			setOverload(forwardQuery, state.snapshot.Protection.OverloadAction, info)
 			p.metrics.admission.WithLabelValues("group", groupID, "rejected", state.snapshot.Protection.OverloadAction).Inc()
-			return errOverloaded
+			return overloadError(info)
 		}
 		p.metrics.admission.WithLabelValues("group", groupID, "accepted", "").Inc()
 		p.metrics.inFlight.WithLabelValues("group", groupID).Inc()
@@ -443,6 +473,7 @@ func (p *Plugin) router() *chi.Mux {
 	r := chi.NewRouter()
 	r.Use(p.authorize)
 	r.Get("/status", p.handleStatus)
+	r.Get("/runtime-status", p.handleRuntimeStatus)
 	r.Put("/snapshot", p.handleSnapshot)
 	r.Post("/flush", p.handleFlush)
 	return r
@@ -469,6 +500,35 @@ func (p *Plugin) handleStatus(w http.ResponseWriter, _ *http.Request) {
 	}
 	defer p.release(state)
 	writeJSON(w, http.StatusOK, state.snapshot)
+}
+
+func (p *Plugin) handleRuntimeStatus(w http.ResponseWriter, _ *http.Request) {
+	state, err := p.acquire()
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
+	defer p.release(state)
+	status := RuntimeStatus{
+		RegistryVersion: state.snapshot.Version,
+		Global: RuntimeConcurrency{
+			InFlight: p.globalInFlight.Load(),
+			Limit:    state.snapshot.Protection.GlobalMaxInFlight,
+		},
+		Groups: make([]GroupRuntimeStatus, 0, len(state.snapshot.Groups)),
+	}
+	for _, config := range state.snapshot.Groups {
+		group := state.groups[config.ID]
+		status.Groups = append(status.Groups, GroupRuntimeStatus{
+			ID:       config.ID,
+			Name:     config.Name,
+			Enabled:  config.Enabled,
+			InFlight: group.inFlight.Load(),
+			Limit:    effectiveGroupLimit(state.snapshot.Protection, config),
+		})
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	writeJSON(w, http.StatusOK, status)
 }
 
 func (p *Plugin) handleSnapshot(w http.ResponseWriter, r *http.Request) {

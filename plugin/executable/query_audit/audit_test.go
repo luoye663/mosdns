@@ -3,6 +3,7 @@ package query_audit
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -205,6 +206,28 @@ func TestBuildEventOmitsMinimumTTLWithoutAnswer(t *testing.T) {
 	qCtx.SetResponse(response)
 	if event := p.buildEvent(qCtx, time.Now(), nil); event.AnswerMinTTLSeconds != nil {
 		t.Fatalf("minimum answer TTL = %v, want nil", event.AnswerMinTTLSeconds)
+	}
+}
+
+func TestBuildEventClassifiesConcurrencyLimits(t *testing.T) {
+	p := newTestAuditPlugin(t, "http://127.0.0.1:1", 1, 1)
+	defer p.Close()
+
+	for _, test := range []struct {
+		name, code string
+		info       query_context.OverloadInfo
+	}{
+		{name: "global", code: "DNS_CONCURRENCY_LIMIT_GLOBAL", info: query_context.OverloadInfo{Scope: query_context.OverloadScopeGlobal, Limit: 32}},
+		{name: "group", code: "DNS_CONCURRENCY_LIMIT_GROUP", info: query_context.OverloadInfo{Scope: query_context.OverloadScopeGroup, GroupID: "default", Limit: 16}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			qCtx := testContext(test.name + "-overload.example")
+			query_context.SetOverloadInfo(qCtx, test.info)
+			event := p.buildEvent(qCtx, time.Now(), errors.New("DNS concurrency limit reached"))
+			if event.ErrorCode != test.code || event.ErrorText != "DNS concurrency limit reached" {
+				t.Fatalf("overload event = %+v", event)
+			}
+		})
 	}
 }
 

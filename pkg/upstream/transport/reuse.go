@@ -109,6 +109,7 @@ func (t *ReuseConnTransport) ExchangeContext(ctx context.Context, m []byte) (*[]
 		}
 
 		resp, err := c.exchange(ctx, queryPayload)
+		pool.ReleaseBuf(queryPayload)
 		if err != nil {
 			if !isNewConn && retry <= maxRetry {
 				retry++
@@ -323,7 +324,14 @@ func (c *reusableConn) exchange(ctx context.Context, q *[]byte) (*[]byte, error)
 	if c.t.testWaitRespTimeout > 0 {
 		waitRespTimeout = c.t.testWaitRespTimeout
 	}
-	c.c.SetDeadline(time.Now().Add(waitRespTimeout))
+	deadline := time.Now().Add(waitRespTimeout)
+	if contextDeadline, ok := ctx.Deadline(); ok && contextDeadline.Before(deadline) {
+		deadline = contextDeadline
+	}
+	if err := c.c.SetDeadline(deadline); err != nil {
+		c.closeWithErr(err)
+		return nil, err
+	}
 	_, err := c.c.Write(*q)
 	if err != nil {
 		c.closeWithErr(err)

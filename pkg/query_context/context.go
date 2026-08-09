@@ -60,6 +60,7 @@ var (
 	requestedUpstreamGroupKey = RegKey()
 	upstreamRuntimeMetaKey    = RegKey()
 	overloadActionKey         = RegKey()
+	overloadInfoKey           = RegKey()
 )
 
 type OverloadAction string
@@ -78,6 +79,29 @@ func OverloadActionFromContext(ctx *Context) (OverloadAction, bool) {
 	value, ok := ctx.GetValue(overloadActionKey)
 	action, valid := value.(OverloadAction)
 	return action, ok && valid
+}
+
+type OverloadScope string
+
+const (
+	OverloadScopeGlobal OverloadScope = "global"
+	OverloadScopeGroup  OverloadScope = "group"
+)
+
+type OverloadInfo struct {
+	Scope   OverloadScope
+	GroupID string
+	Limit   int
+}
+
+func SetOverloadInfo(ctx *Context, info OverloadInfo) {
+	ctx.StoreValue(overloadInfoKey, info)
+}
+
+func OverloadInfoFromContext(ctx *Context) (OverloadInfo, bool) {
+	value, ok := ctx.GetValue(overloadInfoKey)
+	info, valid := value.(OverloadInfo)
+	return info, ok && valid
 }
 
 // UpstreamRuntimeMeta describes the runtime route selected for this query.

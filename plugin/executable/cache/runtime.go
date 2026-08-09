@@ -40,6 +40,8 @@ type flight struct {
 	err         error
 	action      query_context.OverloadAction
 	hasAction   bool
+	overload    query_context.OverloadInfo
+	hasOverload bool
 }
 
 func NewRuntime(config RuntimeConfig) (*Runtime, error) {
@@ -101,6 +103,9 @@ func (r *Runtime) Exec(ctx context.Context, qCtx *query_context.Context, forward
 			if existing.hasAction {
 				query_context.SetOverloadAction(qCtx, existing.action)
 			}
+			if existing.hasOverload {
+				query_context.SetOverloadInfo(qCtx, existing.overload)
+			}
 			return false, existing.upstreamTag, existing.err
 		}
 	}
@@ -118,6 +123,7 @@ func (r *Runtime) Exec(ctx context.Context, qCtx *query_context.Context, forward
 	}
 	currentFlight.upstreamTag, currentFlight.err = upstreamTag, err
 	currentFlight.action, currentFlight.hasAction = query_context.OverloadActionFromContext(qCtx)
+	currentFlight.overload, currentFlight.hasOverload = query_context.OverloadInfoFromContext(qCtx)
 	r.mu.Lock()
 	delete(r.flights, msgKey)
 	close(currentFlight.done)

@@ -334,6 +334,48 @@ func TestRuntimeCoalescesConcurrentColdMisses(t *testing.T) {
 	}
 }
 
+func TestRuntimePropagatesOverloadInfoToColdMissWaiter(t *testing.T) {
+	runtime := newTestRuntime(t, 0)
+	started, release := make(chan struct{}), make(chan struct{})
+	wantErr := errors.New("DNS concurrency limit reached")
+	leaderCtx := query_context.NewContext(runtimeQuery("overloaded.example."))
+	leaderDone := make(chan error, 1)
+	go func() {
+		_, _, err := runtime.Exec(context.Background(), leaderCtx, func(_ context.Context, qCtx *query_context.Context) error {
+			close(started)
+			<-release
+			query_context.SetOverloadAction(qCtx, query_context.OverloadREFUSED)
+			query_context.SetOverloadInfo(qCtx, query_context.OverloadInfo{Scope: query_context.OverloadScopeGroup, GroupID: "default", Limit: 16})
+			return wantErr
+		})
+		leaderDone <- err
+	}()
+	<-started
+
+	waiterCtx := query_context.NewContext(runtimeQuery("overloaded.example."))
+	waiterDone := make(chan error, 1)
+	go func() {
+		_, _, err := runtime.Exec(context.Background(), waiterCtx, func(context.Context, *query_context.Context) error {
+			return errors.New("waiter unexpectedly forwarded")
+		})
+		waiterDone <- err
+	}()
+	time.Sleep(20 * time.Millisecond)
+	close(release)
+	if err := <-leaderDone; !errors.Is(err, wantErr) {
+		t.Fatalf("leader error = %v", err)
+	}
+	if err := <-waiterDone; !errors.Is(err, wantErr) {
+		t.Fatalf("waiter error = %v", err)
+	}
+	if action, ok := query_context.OverloadActionFromContext(waiterCtx); !ok || action != query_context.OverloadREFUSED {
+		t.Fatalf("waiter overload action = %q ok=%t", action, ok)
+	}
+	if info, ok := query_context.OverloadInfoFromContext(waiterCtx); !ok || info.Scope != query_context.OverloadScopeGroup || info.GroupID != "default" || info.Limit != 16 {
+		t.Fatalf("waiter overload info = %+v ok=%t", info, ok)
+	}
+}
+
 func TestCacheTTLAPIFlushesExistingEntries(t *testing.T) {
 	c := NewCache(&Args{Size: 16}, Opts{})
 	c.controlToken = []byte("cache-test-token")
