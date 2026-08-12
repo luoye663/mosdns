@@ -7,10 +7,11 @@ type Marks struct {
 	AccessBlock uint32 `yaml:"access_block"`
 	AccessAllow uint32 `yaml:"access_allow"`
 	NoLog       uint32 `yaml:"no_log"`
+	LocalAnswer uint32 `yaml:"local_answer"`
 }
 
 func defaultMarks() Marks {
-	return Marks{AccessBlock: 1001, AccessAllow: 1002, NoLog: 1201}
+	return Marks{AccessBlock: 1001, AccessAllow: 1002, NoLog: 1201, LocalAnswer: 1301}
 }
 
 func (m Marks) validate() error {
@@ -18,7 +19,7 @@ func (m Marks) validate() error {
 		name  string
 		value uint32
 	}{
-		{"access_block", m.AccessBlock}, {"access_allow", m.AccessAllow}, {"no_log", m.NoLog},
+		{"access_block", m.AccessBlock}, {"access_allow", m.AccessAllow}, {"no_log", m.NoLog}, {"local_answer", m.LocalAnswer},
 	}
 	seen := make(map[uint32]string, len(values))
 	for _, item := range values {

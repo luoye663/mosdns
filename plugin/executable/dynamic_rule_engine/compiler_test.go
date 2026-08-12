@@ -18,13 +18,18 @@ func routeBinding(sourceID, bindingID int64, group string, priority int, domains
 	return SubscriptionSet{SourceID: sourceID, SourceName: fmt.Sprintf("source-%d", sourceID), BindingID: bindingID, UpstreamGroupID: group, Category: CategoryRoute, Action: ActionUpstream, Priority: priority, Domains: domains}
 }
 
-func TestCompileAcceptsOnlySchema4(t *testing.T) {
-	for _, version := range []uint32{0, 1, 2, 3, 5} {
+func TestCompileAcceptsCurrentAndLegacySchema(t *testing.T) {
+	for _, version := range []uint32{0, 1, 2, 3, 6} {
 		snapshot := testSnapshot()
 		snapshot.SchemaVersion = version
 		if _, err := Compile(snapshot, DefaultLimits()); err == nil {
 			t.Fatalf("schema %d accepted", version)
 		}
+	}
+	legacy := testSnapshot()
+	legacy.SchemaVersion = LegacySchemaVersion
+	if _, err := Compile(legacy, DefaultLimits()); err != nil {
+		t.Fatal(err)
 	}
 	if _, err := Compile(testSnapshot(), DefaultLimits()); err != nil {
 		t.Fatal(err)
@@ -119,6 +124,30 @@ func TestAccessAndLoggingRemainIndependent(t *testing.T) {
 	result, _ := compiled.Match("www.example.com")
 	if result.Access.RuleID != 2 || result.Logging.RuleID != 3 {
 		t.Fatalf("result = %+v", result)
+	}
+}
+
+func TestStaticAnswerNormalizesAddressesAndMatchesRegexp(t *testing.T) {
+	compiled, err := Compile(testSnapshot(Rule{ID: 7, Category: CategoryAnswer, Action: ActionStatic, MatchType: MatchTypeRegexp, Pattern: `^api\..+$`, Priority: 10, IPv4Addresses: []string{"192.0.2.2", "192.0.2.2"}, IPv6Addresses: []string{"2001:0db8::1"}, TTL: 600}), DefaultLimits())
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := compiled.Match("api.example")
+	if err != nil || result.Answer.RuleID != 7 || len(result.Answer.IPv4Addresses) != 1 || result.Answer.IPv6Addresses[0] != "2001:db8::1" || result.Answer.TTL != 600 {
+		t.Fatalf("answer=%+v err=%v", result.Answer, err)
+	}
+}
+
+func TestStaticAnswerRejectsInvalidFields(t *testing.T) {
+	invalid := []Rule{
+		{ID: 1, Category: CategoryAnswer, Action: ActionStatic, MatchType: MatchTypeFull, Pattern: "x.example", TTL: 300},
+		{ID: 1, Category: CategoryAnswer, Action: ActionStatic, MatchType: MatchTypeFull, Pattern: "x.example", IPv4Addresses: []string{"2001:db8::1"}, TTL: 300},
+		{ID: 1, Category: CategoryAccess, Action: ActionAllow, MatchType: MatchTypeFull, Pattern: "x.example", IPv4Addresses: []string{"192.0.2.1"}},
+	}
+	for _, rule := range invalid {
+		if _, err := Compile(testSnapshot(rule), DefaultLimits()); err == nil {
+			t.Fatalf("accepted %+v", rule)
+		}
 	}
 }
 

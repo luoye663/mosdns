@@ -4,14 +4,17 @@ package dynamic_rule_engine
 import (
 	"context"
 	"fmt"
+	"net"
 	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
 
 	"github.com/IrineSistiana/mosdns/v5/coremain"
+	"github.com/IrineSistiana/mosdns/v5/pkg/dnsutils"
 	"github.com/IrineSistiana/mosdns/v5/pkg/query_context"
 	"github.com/IrineSistiana/mosdns/v5/plugin/executable/sequence"
+	"github.com/miekg/dns"
 	"github.com/prometheus/client_golang/prometheus"
 )
 
@@ -145,6 +148,8 @@ func validateArgs(args *Args) error {
 	}
 	if args.Marks == (Marks{}) {
 		args.Marks = defaultMarks()
+	} else if args.Marks.LocalAnswer == 0 {
+		args.Marks.LocalAnswer = defaultMarks().LocalAnswer
 	}
 	return args.Marks.validate()
 }
@@ -274,6 +279,23 @@ func (p *Plugin) Exec(_ context.Context, qCtx *query_context.Context) error {
 	}
 	if result.Logging.Action == ActionNoLog {
 		qCtx.SetMark(p.marks.NoLog)
+	}
+	question := qCtx.QQuestion()
+	if result.Access.Action != ActionBlock && result.Answer.Action == ActionStatic && question.Qclass == dns.ClassINET && (question.Qtype == dns.TypeA || question.Qtype == dns.TypeAAAA) {
+		response := dnsutils.GenEmptyReply(qCtx.Q(), dns.RcodeSuccess)
+		name := dns.Fqdn(result.NormalizedQName)
+		if question.Qtype == dns.TypeA {
+			for _, value := range result.Answer.IPv4Addresses {
+				response.Answer = append(response.Answer, &dns.A{Hdr: dns.RR_Header{Name: name, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: result.Answer.TTL}, A: net.ParseIP(value).To4()})
+			}
+		} else {
+			for _, value := range result.Answer.IPv6Addresses {
+				response.Answer = append(response.Answer, &dns.AAAA{Hdr: dns.RR_Header{Name: name, Rrtype: dns.TypeAAAA, Class: dns.ClassINET, Ttl: result.Answer.TTL}, AAAA: net.ParseIP(value)})
+			}
+		}
+		qCtx.SetResponse(response)
+		qCtx.SetMark(p.marks.LocalAnswer)
+		decision.AnswerRuleID = result.Answer.RuleID
 	}
 	qCtx.StoreValue(runtimeDecisionKey, decision)
 	return nil

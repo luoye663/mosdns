@@ -163,7 +163,7 @@ func TestExecObservesGotoAndAccept(t *testing.T) {
 	}
 	select {
 	case event := <-events:
-		if event.QName != "goto.example" || event.RCode != dns.RcodeSuccess || event.Route != "forward" || event.SchemaVersion != 2 {
+		if event.QName != "goto.example" || event.RCode != dns.RcodeSuccess || event.Route != "forward" || event.SchemaVersion != eventSchemaVersion {
 			t.Fatalf("goto/accept event = %+v", event)
 		}
 	case <-time.After(time.Second):

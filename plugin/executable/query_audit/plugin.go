@@ -31,7 +31,7 @@ import (
 
 const (
 	PluginType            = "query_audit"
-	eventSchemaVersion    = 2
+	eventSchemaVersion    = 3
 	shutdownFlushLimit    = 2 * time.Second
 	maxAnswerIPs          = 16
 	maxAnswerRecords      = 32
@@ -83,6 +83,7 @@ type QueryEvent struct {
 	SnapshotVersion        uint64   `json:"snapshot_version"`
 	AccessRuleID           int64    `json:"access_rule_id"`
 	RouteRuleID            int64    `json:"route_rule_id"`
+	AnswerRuleID           int64    `json:"answer_rule_id"`
 	SubscriptionSourceID   int64    `json:"subscription_source_id"`
 	SubscriptionSourceName string   `json:"subscription_source_name"`
 	SubscriptionBindingID  int64    `json:"subscription_binding_id"`
@@ -298,7 +299,7 @@ func (p *Plugin) buildEvent(qCtx *query_context.Context, started time.Time, exec
 		AnswerCount: answerCount, LatencyUS: time.Since(started).Microseconds(),
 	}
 	if decision, ok := dynamic_rule_engine.RuntimeDecisionFromContext(qCtx); ok {
-		event.SnapshotVersion, event.AccessRuleID, event.RouteRuleID = decision.SnapshotVersion, decision.AccessRuleID, decision.RouteRuleID
+		event.SnapshotVersion, event.AccessRuleID, event.RouteRuleID, event.AnswerRuleID = decision.SnapshotVersion, decision.AccessRuleID, decision.RouteRuleID, decision.AnswerRuleID
 		if decision.AccessSubscriptionSourceID != 0 {
 			event.SubscriptionSourceID, event.SubscriptionSourceName = decision.AccessSubscriptionSourceID, decision.AccessSubscriptionSourceName
 			event.SubscriptionCategories = appendUnique(event.SubscriptionCategories, dynamic_rule_engine.CategoryAccess)
@@ -399,6 +400,9 @@ func (p *Plugin) route(qCtx *query_context.Context) (route, source, upstream str
 		return "block", "dynamic_rule", ""
 	}
 	if decision, ok := dynamic_rule_engine.RuntimeDecisionFromContext(qCtx); ok {
+		if decision.AnswerRuleID != 0 {
+			return "local", "dynamic_rule", ""
+		}
 		if decision.RouteSource != "" {
 			return "forward", decision.RouteSource, decision.UpstreamGroupID
 		}

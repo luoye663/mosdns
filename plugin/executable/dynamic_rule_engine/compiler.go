@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/netip"
 	"regexp"
 	"sort"
 	"strings"
@@ -14,7 +15,7 @@ import (
 	"unicode/utf8"
 )
 
-const categoryCount = 3
+const categoryCount = 4
 
 type compiledRegex struct {
 	re       *regexp.Regexp
@@ -54,7 +55,7 @@ func (s *CompiledSnapshot) LoadedAt() time.Time   { return s.loadedAt }
 // Compile 在 DNS 请求路径外执行全部校验和索引构建。
 func Compile(snapshot Snapshot, limits Limits) (*CompiledSnapshot, error) {
 	limits = normalizeLimits(limits)
-	if snapshot.SchemaVersion != SchemaVersion {
+	if snapshot.SchemaVersion != SchemaVersion && snapshot.SchemaVersion != LegacySchemaVersion {
 		return nil, fmt.Errorf("schema_version %d is unsupported", snapshot.SchemaVersion)
 	}
 	if snapshot.Version == 0 {
@@ -204,6 +205,7 @@ func (s *CompiledSnapshot) addRule(rule Rule) error {
 	match := MatchedRule{
 		RuleID: rule.ID, Action: rule.Action, MatchType: rule.MatchType,
 		Pattern: rule.Pattern, Priority: rule.Priority, UpstreamGroupID: rule.UpstreamGroupID,
+		IPv4Addresses: rule.IPv4Addresses, IPv6Addresses: rule.IPv6Addresses, TTL: rule.TTL,
 	}
 	switch rule.MatchType {
 	case MatchTypeFull:
@@ -229,6 +231,7 @@ func (s *CompiledSnapshot) Match(qname string) (MatchResult, error) {
 	result.Access = s.matchCategory(normalized, categoryAccess)
 	result.Route = s.matchCategory(normalized, categoryRoute)
 	result.Logging = s.matchCategory(normalized, categoryLogging)
+	result.Answer = s.matchCategory(normalized, categoryAnswer)
 	return result, nil
 }
 
@@ -332,6 +335,23 @@ func normalizeRule(rule Rule, limits Limits) (Rule, bool, error) {
 	} else if rule.UpstreamGroupID != "" {
 		return Rule{}, false, fmt.Errorf("upstream_group_id is only valid for route rules")
 	}
+	if rule.Category == CategoryAnswer {
+		if rule.TTL < 1 || rule.TTL > 86400 {
+			return Rule{}, false, fmt.Errorf("ttl must be within 1..86400")
+		}
+		var err error
+		if rule.IPv4Addresses, err = normalizeAddresses(rule.IPv4Addresses, true); err != nil {
+			return Rule{}, false, err
+		}
+		if rule.IPv6Addresses, err = normalizeAddresses(rule.IPv6Addresses, false); err != nil {
+			return Rule{}, false, err
+		}
+		if len(rule.IPv4Addresses)+len(rule.IPv6Addresses) == 0 {
+			return Rule{}, false, fmt.Errorf("static answer requires at least one address")
+		}
+	} else if len(rule.IPv4Addresses) != 0 || len(rule.IPv6Addresses) != 0 || rule.TTL != 0 {
+		return Rule{}, false, fmt.Errorf("address fields are only valid for answer rules")
+	}
 	if rule.Priority < 0 || rule.Priority > 1000 {
 		return Rule{}, false, fmt.Errorf("priority %d is outside 0..1000", rule.Priority)
 	}
@@ -371,6 +391,8 @@ func categoryIndex(category string) (int, bool) {
 		return categoryRoute, true
 	case CategoryLogging:
 		return categoryLogging, true
+	case CategoryAnswer:
+		return categoryAnswer, true
 	default:
 		return 0, false
 	}
@@ -380,6 +402,7 @@ const (
 	categoryAccess = iota
 	categoryRoute
 	categoryLogging
+	categoryAnswer
 )
 
 func validAction(category, action string) bool {
@@ -390,9 +413,37 @@ func validAction(category, action string) bool {
 		return action == ActionUpstream
 	case CategoryLogging:
 		return action == ActionNoLog
+	case CategoryAnswer:
+		return action == ActionStatic
 	default:
 		return false
 	}
+}
+
+func normalizeAddresses(values []string, want4 bool) ([]string, error) {
+	if len(values) > 16 {
+		return nil, fmt.Errorf("address family exceeds 16 entries")
+	}
+	seen := make(map[string]struct{}, len(values))
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		addr, err := netip.ParseAddr(strings.TrimSpace(value))
+		if err != nil || addr.Is4() != want4 {
+			family := 6
+			if want4 {
+				family = 4
+			}
+			return nil, fmt.Errorf("invalid IPv%d address %q", family, value)
+		}
+		normalized := addr.String()
+		if _, ok := seen[normalized]; ok {
+			continue
+		}
+		seen[normalized] = struct{}{}
+		out = append(out, normalized)
+	}
+	sort.Strings(out)
+	return out, nil
 }
 
 var upstreamGroupIDRegexp = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,63}$`)
