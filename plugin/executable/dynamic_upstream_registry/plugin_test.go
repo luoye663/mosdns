@@ -40,7 +40,8 @@ func startDNSServer(t *testing.T, ip string, rcode int, observe func(*dns.Msg)) 
 		t.Fatal(err)
 	}
 	result := &testDNSServer{addr: "udp://" + conn.LocalAddr().String()}
-	result.server = &dns.Server{PacketConn: conn, Handler: dns.HandlerFunc(func(w dns.ResponseWriter, request *dns.Msg) {
+	started := make(chan struct{})
+	result.server = &dns.Server{PacketConn: conn, NotifyStartedFunc: func() { close(started) }, Handler: dns.HandlerFunc(func(w dns.ResponseWriter, request *dns.Msg) {
 		result.requests.Add(1)
 		if observe != nil {
 			observe(request)
@@ -53,13 +54,20 @@ func startDNSServer(t *testing.T, ip string, rcode int, observe func(*dns.Msg)) 
 		}
 		_ = w.WriteMsg(response)
 	})}
-	go func() { _ = result.server.ActivateAndServe() }()
+	serveErr := make(chan error, 1)
+	go func() { serveErr <- result.server.ActivateAndServe() }()
+	select {
+	case <-started:
+	case err := <-serveErr:
+		_ = conn.Close()
+		t.Fatalf("start DNS server: %v", err)
+	}
 	t.Cleanup(func() { _ = result.server.Shutdown() })
 	return result
 }
 
 func group(id, name, addr string) Group {
-	return Group{ID: id, Name: name, Enabled: true, Mode: "race", Concurrent: 1, Upstreams: []dynamic_forward.Upstream{{Tag: id + "_upstream", Addr: addr}}, ECS: dynamic_ecs.Config{Mode: "off"}, Cache: GroupCacheConfig{Enabled: true, Size: 1024}}
+	return Group{ID: id, Name: name, Enabled: true, Mode: "race", Concurrent: 1, Upstreams: []dynamic_forward.Upstream{{Tag: id + "_upstream", Addr: addr, TimeoutMS: 4000}}, ECS: dynamic_ecs.Config{Mode: "off"}, Cache: GroupCacheConfig{Enabled: true, Size: 1024}}
 }
 
 func snapshot(version uint64, groups ...Group) Snapshot {
@@ -612,7 +620,7 @@ func TestCacheDumpsSurviveRestartWithIsolationAndDecreasingTTL(t *testing.T) {
 	if err := p.Close(); err != nil {
 		t.Fatal(err)
 	}
-	time.Sleep(1100 * time.Millisecond)
+	time.Sleep(2100 * time.Millisecond)
 
 	restarted, err := newPlugin(args, zap.NewNop(), "restart")
 	if err != nil {
