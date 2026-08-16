@@ -31,7 +31,7 @@ import (
 
 const (
 	PluginType            = "query_audit"
-	eventSchemaVersion    = 1
+	eventSchemaVersion    = 3
 	shutdownFlushLimit    = 2 * time.Second
 	maxAnswerIPs          = 16
 	maxAnswerRecords      = 32
@@ -43,15 +43,9 @@ var Version = "dev"
 
 // Marks 统一定义审计读取的 marks，启动时会检查彼此不冲突。
 type Marks struct {
-	AccessBlock        uint32 `yaml:"access_block"`
-	RouteLocal         uint32 `yaml:"route_local"`
-	RouteRemote        uint32 `yaml:"route_remote"`
-	NoLog              uint32 `yaml:"no_log"`
-	SubscriptionLocal  uint32 `yaml:"subscription_local"`
-	SubscriptionRemote uint32 `yaml:"subscription_remote"`
-	SubscriptionBlock  uint32 `yaml:"subscription_block"`
-	SubscriptionAllow  uint32 `yaml:"subscription_allow"`
-	CacheHit           uint32 `yaml:"cache_hit"`
+	AccessBlock uint32 `yaml:"access_block"`
+	NoLog       uint32 `yaml:"no_log"`
+	CacheHit    uint32 `yaml:"cache_hit"`
 }
 
 // Args 是 query_audit 的 YAML 配置；启用 include_answers 时携带受限的 Answer 区诊断数据。
@@ -89,8 +83,10 @@ type QueryEvent struct {
 	SnapshotVersion        uint64   `json:"snapshot_version"`
 	AccessRuleID           int64    `json:"access_rule_id"`
 	RouteRuleID            int64    `json:"route_rule_id"`
+	AnswerRuleID           int64    `json:"answer_rule_id"`
 	SubscriptionSourceID   int64    `json:"subscription_source_id"`
 	SubscriptionSourceName string   `json:"subscription_source_name"`
+	SubscriptionBindingID  int64    `json:"subscription_binding_id"`
 	AnswerCount            int      `json:"answer_count"`
 	AnswerMinTTLSeconds    *uint32  `json:"answer_min_ttl_seconds"`
 	SubscriptionCategories []string `json:"subscription_categories,omitempty"`
@@ -233,7 +229,7 @@ func validateArgs(args *Args) error {
 		args.MaxErrorTextBytes = 256
 	}
 	if args.Marks == (Marks{}) {
-		args.Marks = Marks{AccessBlock: 1001, RouteLocal: 1101, RouteRemote: 1102, NoLog: 1201, SubscriptionLocal: 1301, SubscriptionRemote: 1302, SubscriptionBlock: 1303, SubscriptionAllow: 1304, CacheHit: 2101}
+		args.Marks = Marks{AccessBlock: 1001, NoLog: 1201, CacheHit: 2101}
 	}
 	if args.QueueSize < 1 || args.BatchSize < 1 {
 		return fmt.Errorf("queue_size and batch_size must be greater than zero")
@@ -251,7 +247,8 @@ func validateArgs(args *Args) error {
 		return fmt.Errorf("request_timeout must be a positive duration")
 	}
 	seen := map[uint32]string{}
-	for name, value := range map[string]uint32{"access_block": args.Marks.AccessBlock, "route_local": args.Marks.RouteLocal, "route_remote": args.Marks.RouteRemote, "no_log": args.Marks.NoLog, "subscription_local": args.Marks.SubscriptionLocal, "subscription_remote": args.Marks.SubscriptionRemote, "subscription_block": args.Marks.SubscriptionBlock, "subscription_allow": args.Marks.SubscriptionAllow, "cache_hit": args.Marks.CacheHit} {
+	requiredMarks := map[string]uint32{"access_block": args.Marks.AccessBlock, "no_log": args.Marks.NoLog, "cache_hit": args.Marks.CacheHit}
+	for name, value := range requiredMarks {
 		if value == 0 {
 			return fmt.Errorf("marks.%s must be greater than zero", name)
 		}
@@ -289,29 +286,43 @@ func (p *Plugin) buildEvent(qCtx *query_context.Context, started time.Time, exec
 		rcode, answerCount = response.Rcode, len(response.Answer)
 	}
 	route, routeSource, upstream := p.route(qCtx)
+	upstreamTag := fastforward.SelectedUpstreamTag(qCtx)
+	cacheHit := qCtx.HasMark(p.marks.CacheHit)
+	if metadata, ok := query_context.UpstreamRuntimeMetaFromContext(qCtx); ok {
+		routeSource, upstream, upstreamTag, cacheHit = metadata.RouteSource, metadata.GroupID, metadata.UpstreamTag, metadata.CacheHit
+		route = "forward"
+	}
 	event := &QueryEvent{
 		SchemaVersion: eventSchemaVersion, EventID: p.newEventID(), TimestampUnixMS: time.Now().UnixMilli(), ProcessStartedAtUnixMS: p.processStarted.UnixMilli(),
 		ClientIP: qCtx.ServerMeta.ClientAddr.String(), Protocol: protocol(qCtx), QName: normalizeQName(question.Name), QType: question.Qtype, QClass: question.Qclass,
-		RCode: rcode, Route: route, RouteSource: routeSource, UpstreamGroup: upstream, UpstreamTag: fastforward.SelectedUpstreamTag(qCtx), CacheHit: qCtx.HasMark(p.marks.CacheHit),
+		RCode: rcode, Route: route, RouteSource: routeSource, UpstreamGroup: upstream, UpstreamTag: upstreamTag, CacheHit: cacheHit,
 		AnswerCount: answerCount, LatencyUS: time.Since(started).Microseconds(),
 	}
-	for _, category := range []struct {
-		mark uint32
-		name string
-	}{{p.marks.SubscriptionAllow, "allow"}, {p.marks.SubscriptionBlock, "block"}, {p.marks.SubscriptionLocal, "local"}, {p.marks.SubscriptionRemote, "remote"}} {
-		if qCtx.HasMark(category.mark) {
-			event.SubscriptionCategories = append(event.SubscriptionCategories, category.name)
-		}
-	}
 	if decision, ok := dynamic_rule_engine.RuntimeDecisionFromContext(qCtx); ok {
-		event.SnapshotVersion, event.AccessRuleID, event.RouteRuleID = decision.SnapshotVersion, decision.AccessRuleID, decision.RouteRuleID
-		event.SubscriptionSourceID, event.SubscriptionSourceName = decision.SubscriptionSourceID, decision.SubscriptionSourceName
+		event.SnapshotVersion, event.AccessRuleID, event.RouteRuleID, event.AnswerRuleID = decision.SnapshotVersion, decision.AccessRuleID, decision.RouteRuleID, decision.AnswerRuleID
+		if decision.AccessSubscriptionSourceID != 0 {
+			event.SubscriptionSourceID, event.SubscriptionSourceName = decision.AccessSubscriptionSourceID, decision.AccessSubscriptionSourceName
+			event.SubscriptionCategories = appendUnique(event.SubscriptionCategories, dynamic_rule_engine.CategoryAccess)
+		}
+		if event.Route == "forward" && decision.RouteSubscriptionSourceID != 0 {
+			event.SubscriptionSourceID, event.SubscriptionSourceName = decision.RouteSubscriptionSourceID, decision.RouteSubscriptionSourceName
+			event.SubscriptionBindingID = decision.RouteSubscriptionBindingID
+			event.SubscriptionCategories = appendUnique(event.SubscriptionCategories, dynamic_rule_engine.CategoryRoute)
+		}
 		if event.RouteSource == "" {
 			event.RouteSource = decision.RouteSource
 		}
 	}
 	if execErr != nil {
 		event.ErrorCode = "DNS_PROCESSING_ERROR"
+		if overload, ok := query_context.OverloadInfoFromContext(qCtx); ok {
+			switch overload.Scope {
+			case query_context.OverloadScopeGlobal:
+				event.ErrorCode = "DNS_CONCURRENCY_LIMIT_GLOBAL"
+			case query_context.OverloadScopeGroup:
+				event.ErrorCode = "DNS_CONCURRENCY_LIMIT_GROUP"
+			}
+		}
 		if p.includeErrors {
 			event.ErrorText = truncate(execErr.Error(), p.maxErrorBytes)
 		}
@@ -383,34 +394,32 @@ func answerRecords(response *dns.Msg) []string {
 
 func (p *Plugin) route(qCtx *query_context.Context) (route, source, upstream string) {
 	if qCtx.HasMark(p.marks.AccessBlock) {
-		if qCtx.HasMark(p.marks.SubscriptionBlock) {
+		if decision, ok := dynamic_rule_engine.RuntimeDecisionFromContext(qCtx); ok && decision.AccessSubscriptionSourceID != 0 && decision.AccessSubscriptionAction == dynamic_rule_engine.ActionBlock {
 			return "block", "subscription", ""
 		}
 		return "block", "dynamic_rule", ""
 	}
-	dynamicSource := false
 	if decision, ok := dynamic_rule_engine.RuntimeDecisionFromContext(qCtx); ok {
-		dynamicSource = decision.RouteSource == "dynamic_rule"
+		if decision.AnswerRuleID != 0 {
+			return "local", "dynamic_rule", ""
+		}
+		if decision.RouteSource != "" {
+			return "forward", decision.RouteSource, decision.UpstreamGroupID
+		}
 	}
-	if qCtx.HasMark(p.marks.RouteLocal) {
-		if qCtx.HasMark(p.marks.SubscriptionLocal) {
-			return "local", "subscription", "local_dns"
-		}
-		if dynamicSource {
-			return "local", "dynamic_rule", "local_dns"
-		}
-		return "local", "default", "local_dns"
+	if groupID, ok := query_context.UpstreamGroupID(qCtx); ok {
+		return "forward", "subscription", groupID
 	}
-	if qCtx.HasMark(p.marks.RouteRemote) {
-		if qCtx.HasMark(p.marks.SubscriptionRemote) {
-			return "remote", "subscription", "remote_dns"
+	return "forward", "default", ""
+}
+
+func appendUnique(values []string, value string) []string {
+	for _, existing := range values {
+		if existing == value {
+			return values
 		}
-		if dynamicSource {
-			return "remote", "dynamic_rule", "remote_dns"
-		}
-		return "remote", "default", "remote_dns"
 	}
-	return "remote", "default", "remote_dns"
+	return append(values, value)
 }
 
 func (p *Plugin) enqueueNonBlocking(event *QueryEvent) {

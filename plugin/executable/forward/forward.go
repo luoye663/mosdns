@@ -26,6 +26,7 @@ import (
 	"fmt"
 	"math/rand/v2"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/IrineSistiana/mosdns/v5/coremain"
@@ -51,8 +52,9 @@ func init() {
 }
 
 const (
-	maxConcurrentQueries = 3
-	queryTimeout         = time.Second * 5
+	defaultConcurrentQueries = 3
+	maxConcurrentQueries     = 16
+	queryTimeout             = time.Second * 5
 )
 
 type Args struct {
@@ -68,10 +70,11 @@ type Args struct {
 }
 
 type UpstreamConfig struct {
-	Tag         string `yaml:"tag"`
-	Addr        string `yaml:"addr"` // Required.
-	DialAddr    string `yaml:"dial_addr"`
-	IdleTimeout int    `yaml:"idle_timeout"`
+	Tag          string        `yaml:"tag"`
+	Addr         string        `yaml:"addr"` // Required.
+	DialAddr     string        `yaml:"dial_addr"`
+	IdleTimeout  int           `yaml:"idle_timeout"`
+	QueryTimeout time.Duration `yaml:"-"`
 
 	// Deprecated: This option has no affect.
 	// TODO: (v6) Remove this option.
@@ -198,7 +201,7 @@ func (f *Forward) RegisterMetricsTo(r prometheus.Registerer) error {
 }
 
 func (f *Forward) Exec(ctx context.Context, qCtx *query_context.Context) (err error) {
-	r, err := f.exchange(ctx, qCtx, f.us)
+	r, err := f.exchange(ctx, qCtx, f.us, f.args.Concurrent, maxConcurrentQueries)
 	if err != nil {
 		return err
 	}
@@ -220,7 +223,18 @@ func (f *Forward) ExecWithTags(ctx context.Context, qCtx *query_context.Context,
 		}
 		us = append(us, u)
 	}
-	r, err := f.exchange(ctx, qCtx, us)
+	r, err := f.exchange(ctx, qCtx, us, f.args.Concurrent, maxConcurrentQueries)
+	if err != nil {
+		return err
+	}
+	qCtx.SetResponse(r)
+	return nil
+}
+
+// ExecAll races every configured upstream regardless of the bounded
+// concurrency used by the regular forwarding policies.
+func (f *Forward) ExecAll(ctx context.Context, qCtx *query_context.Context) error {
+	r, err := f.exchange(ctx, qCtx, f.us, len(f.us), 0)
 	if err != nil {
 		return err
 	}
@@ -243,7 +257,7 @@ func (f *Forward) QuickConfigureExec(args string) (any, error) {
 		}
 	}
 	var execFunc sequence.ExecutableFunc = func(ctx context.Context, qCtx *query_context.Context) error {
-		r, err := f.exchange(ctx, qCtx, us)
+		r, err := f.exchange(ctx, qCtx, us, f.args.Concurrent, maxConcurrentQueries)
 		if err != nil {
 			return err
 		}
@@ -260,7 +274,7 @@ func (f *Forward) Close() error {
 	return nil
 }
 
-func (f *Forward) exchange(ctx context.Context, qCtx *query_context.Context, us []*upstreamWrapper) (*dns.Msg, error) {
+func (f *Forward) exchange(ctx context.Context, qCtx *query_context.Context, us []*upstreamWrapper, concurrent, maximum int) (*dns.Msg, error) {
 	if len(us) == 0 {
 		return nil, errors.New("no upstream to exchange")
 	}
@@ -271,12 +285,14 @@ func (f *Forward) exchange(ctx context.Context, qCtx *query_context.Context, us 
 	}
 	defer pool.ReleaseBuf(queryPayload)
 
-	concurrent := f.args.Concurrent
 	if concurrent <= 0 {
 		concurrent = 1
 	}
-	if concurrent > maxConcurrentQueries {
-		concurrent = maxConcurrentQueries
+	if maximum > 0 && concurrent > maximum {
+		concurrent = maximum
+	}
+	if concurrent > len(us) {
+		concurrent = len(us)
 	}
 
 	type res struct {
@@ -285,18 +301,27 @@ func (f *Forward) exchange(ctx context.Context, qCtx *query_context.Context, us 
 		upstreamTag string
 	}
 
-	resChan := make(chan res)
-	done := make(chan struct{})
-	defer close(done)
+	resChan := make(chan res, concurrent)
+	racingCtx, cancelRace := context.WithCancel(ctx)
+	var workers sync.WaitGroup
+	defer func() {
+		cancelRace()
+		workers.Wait()
+	}()
 
 	r := rand.IntN(len(us))
 	for i := 0; i < concurrent; i++ {
 		u := us[(r+i)%len(us)]
 		qc := copyPayload(queryPayload)
+		workers.Add(1)
 		go func(uqid uint32, question dns.Question) {
+			defer workers.Done()
 			defer pool.ReleaseBuf(qc)
-			// Give each upstream a fixed timeout to finish the query.
-			upstreamCtx, cancel := context.WithTimeout(context.Background(), queryTimeout)
+			timeout := u.cfg.QueryTimeout
+			if timeout <= 0 {
+				timeout = queryTimeout
+			}
+			upstreamCtx, cancel := context.WithTimeout(racingCtx, timeout)
 			defer cancel()
 
 			var r *dns.Msg
@@ -319,10 +344,7 @@ func (f *Forward) exchange(ctx context.Context, qCtx *query_context.Context, us 
 					r = nil
 				}
 			}
-			select {
-			case resChan <- res{r: r, err: err, upstreamTag: u.cfg.Tag}:
-			case <-done:
-			}
+			resChan <- res{r: r, err: err, upstreamTag: u.cfg.Tag}
 		}(qCtx.Id(), qCtx.QQuestion())
 	}
 
@@ -364,7 +386,7 @@ func SelectedUpstreamTag(qCtx *query_context.Context) string {
 
 func quickSetup(bq sequence.BQ, s string) (any, error) {
 	args := new(Args)
-	args.Concurrent = maxConcurrentQueries
+	args.Concurrent = defaultConcurrentQueries
 	for _, u := range strings.Fields(s) {
 		args.Upstreams = append(args.Upstreams, UpstreamConfig{Addr: u})
 	}

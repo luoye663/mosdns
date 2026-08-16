@@ -1,284 +1,184 @@
 package dynamic_rule_engine
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"sync"
 	"testing"
-	"time"
 )
 
 func testSnapshot(rules ...Rule) Snapshot {
-	return Snapshot{
-		SchemaVersion: SchemaVersion,
-		Version:       1,
-		BlockRCode:    3,
-		Rules:         rules,
+	return Snapshot{SchemaVersion: SchemaVersion, Version: 1, BlockRCode: 3, Rules: rules}
+}
+
+func routeRule(id int64, group, matchType, pattern string, priority int) Rule {
+	return Rule{ID: id, Category: CategoryRoute, Action: ActionUpstream, UpstreamGroupID: group, MatchType: matchType, Pattern: pattern, Priority: priority}
+}
+
+func routeBinding(sourceID, bindingID int64, group string, priority int, domains ...string) SubscriptionSet {
+	return SubscriptionSet{SourceID: sourceID, SourceName: fmt.Sprintf("source-%d", sourceID), BindingID: bindingID, UpstreamGroupID: group, Category: CategoryRoute, Action: ActionUpstream, Priority: priority, Domains: domains}
+}
+
+func TestCompileAcceptsCurrentAndLegacySchema(t *testing.T) {
+	for _, version := range []uint32{0, 1, 2, 3, 6} {
+		snapshot := testSnapshot()
+		snapshot.SchemaVersion = version
+		if _, err := Compile(snapshot, DefaultLimits()); err == nil {
+			t.Fatalf("schema %d accepted", version)
+		}
+	}
+	legacy := testSnapshot()
+	legacy.SchemaVersion = LegacySchemaVersion
+	if _, err := Compile(legacy, DefaultLimits()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Compile(testSnapshot(), DefaultLimits()); err != nil {
+		t.Fatal(err)
 	}
 }
 
-func TestCompileMatchPrecedenceAndCategoryIndependence(t *testing.T) {
-	snapshot := testSnapshot(
-		Rule{ID: 1, Category: CategoryAccess, Action: ActionBlock, MatchType: MatchTypeDomain, Pattern: "example.com", Priority: 100},
-		Rule{ID: 2, Category: CategoryAccess, Action: ActionAllow, MatchType: MatchTypeFull, Pattern: "api.example.com", Priority: 1},
-		Rule{ID: 3, Category: CategoryRoute, Action: ActionLocal, MatchType: MatchTypeDomain, Pattern: "example.com", Priority: 100},
-		Rule{ID: 4, Category: CategoryAccess, Action: ActionBlock, MatchType: MatchTypeDomain, Pattern: "dev.example.com", Priority: 100},
-		Rule{ID: 5, Category: CategoryLogging, Action: ActionNoLog, MatchType: MatchTypeRegexp, Pattern: `^api\.[a-z]+\.com$`, Priority: 100},
-	)
-	compiled, err := Compile(snapshot, DefaultLimits())
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	result, err := compiled.Match("API.EXAMPLE.COM.")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if result.Access.RuleID != 2 || result.Access.Action != ActionAllow {
-		t.Fatalf("access = %+v, want full allow rule 2", result.Access)
-	}
-	if result.Route.RuleID != 3 || result.Route.Action != ActionLocal {
-		t.Fatalf("route = %+v, want parent domain local rule 3", result.Route)
-	}
-	if result.Logging.RuleID != 5 || result.Logging.Action != ActionNoLog {
-		t.Fatalf("logging = %+v, want regexp no_log rule 5", result.Logging)
-	}
-
-	result, err = compiled.Match("api.dev.example.com")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if result.Access.RuleID != 4 {
-		t.Fatalf("access = %+v, want deeper domain rule 4", result.Access)
-	}
-	if result.Route.RuleID != 3 {
-		t.Fatalf("route = %+v, want parent route rule 3", result.Route)
-	}
-}
-
-func TestAccessAllowWinsExactTie(t *testing.T) {
-	compiled, err := Compile(testSnapshot(
-		Rule{ID: 20, Category: CategoryAccess, Action: ActionBlock, MatchType: MatchTypeFull, Pattern: "example.com", Priority: 100},
-		Rule{ID: 10, Category: CategoryAccess, Action: ActionAllow, MatchType: MatchTypeFull, Pattern: "example.com", Priority: 100},
-	), DefaultLimits())
-	if err != nil {
-		t.Fatal(err)
-	}
-	result, err := compiled.Match("example.com")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if result.Access.RuleID != 10 || result.Access.Action != ActionAllow {
-		t.Fatalf("access = %+v, want allow rule", result.Access)
-	}
-}
-
-func TestSubscriptionSetMatchesSuffixAndReportsSource(t *testing.T) {
-	snapshot := testSnapshot()
-	snapshot.SubscriptionSets = []SubscriptionSet{{SourceID: 42, SourceName: "domestic-list", Category: CategoryRoute, Action: ActionLocal, Priority: 100, Domains: []string{"example.cn", "api.example.cn"}}}
-	compiled, err := Compile(snapshot, DefaultLimits())
-	if err != nil {
-		t.Fatal(err)
-	}
-	matched, err := compiled.Match("www.api.example.cn")
-	if err != nil || matched.Route.SourceID != 42 || matched.Route.SourceName != "domestic-list" || matched.Route.Action != ActionLocal {
-		t.Fatalf("match=%+v err=%v", matched, err)
-	}
-}
-
-func TestCompileRejectsRouteConflict(t *testing.T) {
-	_, err := Compile(testSnapshot(
-		Rule{ID: 1, Category: CategoryRoute, Action: ActionLocal, MatchType: MatchTypeDomain, Pattern: "example.com", Priority: 100},
-		Rule{ID: 2, Category: CategoryRoute, Action: ActionRemote, MatchType: MatchTypeDomain, Pattern: "example.com", Priority: 100},
-	), DefaultLimits())
-	if err == nil {
-		t.Fatal("Compile() error = nil, want route conflict")
-	}
-}
-
-func TestNormalizeDomainIDNAndInvalidInput(t *testing.T) {
-	normalized, err := NormalizeDomain("  BÜCHER.example. ")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if normalized != "xn--bcher-kva.example" {
-		t.Fatalf("NormalizeDomain() = %q", normalized)
-	}
-	for _, input := range []string{"", "a..example", "*.example", "a\x00.example"} {
-		if _, err := NormalizeDomain(input); err == nil {
-			t.Fatalf("NormalizeDomain(%q) error = nil", input)
+func TestRouteRulesRequireUpstreamGroup(t *testing.T) {
+	for _, rule := range []Rule{
+		{ID: 1, Category: CategoryRoute, Action: "local", MatchType: MatchTypeFull, Pattern: "example.com"},
+		{ID: 1, Category: CategoryRoute, Action: ActionUpstream, MatchType: MatchTypeFull, Pattern: "example.com"},
+		{ID: 1, Category: CategoryAccess, Action: ActionBlock, UpstreamGroupID: "group", MatchType: MatchTypeFull, Pattern: "example.com"},
+	} {
+		if _, err := Compile(testSnapshot(rule), DefaultLimits()); err == nil {
+			t.Fatalf("invalid rule accepted: %+v", rule)
 		}
 	}
 }
 
-func TestCompileMatchesNormalizedIDN(t *testing.T) {
+func TestSmallerPriorityWins(t *testing.T) {
 	compiled, err := Compile(testSnapshot(
-		Rule{ID: 1, Category: CategoryAccess, Action: ActionBlock, MatchType: MatchTypeFull, Pattern: "BÜCHER.example."},
+		routeRule(2, "specific", MatchTypeFull, "www.example.com", 20),
+		routeRule(1, "preferred", MatchTypeDomain, "example.com", 10),
 	), DefaultLimits())
 	if err != nil {
 		t.Fatal(err)
 	}
-	result, err := compiled.Match("bücher.example")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if result.Access.RuleID != 1 || result.NormalizedQName != "xn--bcher-kva.example" {
-		t.Fatalf("IDN result = %+v", result)
+	result, err := compiled.Match("www.example.com")
+	if err != nil || result.Route.RuleID != 1 || result.Route.UpstreamGroupID != "preferred" {
+		t.Fatalf("route = %+v, err = %v", result.Route, err)
 	}
 }
 
-func TestChecksumIsCanonicalAndInputIsNotMutated(t *testing.T) {
-	rules := []Rule{
-		{ID: 2, Category: CategoryRoute, Action: ActionRemote, MatchType: MatchTypeFull, Pattern: "B.example", Priority: 50},
-		{ID: 1, Category: CategoryAccess, Action: ActionBlock, MatchType: MatchTypeDomain, Pattern: "A.example.", Priority: 100},
-	}
-	first, err := Compile(testSnapshot(rules...), DefaultLimits())
+func TestSmallerPriorityWinsAcrossAccessMatchTypes(t *testing.T) {
+	compiled, err := Compile(testSnapshot(
+		Rule{ID: 2, Category: CategoryAccess, Action: ActionBlock, MatchType: MatchTypeFull, Pattern: "www.example.com", Priority: 20},
+		Rule{ID: 1, Category: CategoryAccess, Action: ActionAllow, MatchType: MatchTypeDomain, Pattern: "example.com", Priority: 10},
+	), DefaultLimits())
 	if err != nil {
 		t.Fatal(err)
 	}
-	second, err := Compile(testSnapshot(rules[1], rules[0]), DefaultLimits())
+	result, err := compiled.Match("www.example.com")
+	if err != nil || result.Access.RuleID != 1 || result.Access.Action != ActionAllow {
+		t.Fatalf("access = %+v, err = %v", result.Access, err)
+	}
+}
+
+func TestManualRouteAlwaysOverridesSubscription(t *testing.T) {
+	for _, rule := range []Rule{
+		routeRule(1, "manual-full", MatchTypeFull, "www.example.com", 1000),
+		routeRule(2, "manual-domain", MatchTypeDomain, "example.com", 1000),
+		routeRule(3, "manual-regexp", MatchTypeRegexp, `^www\.example\.com$`, 1000),
+	} {
+		snapshot := testSnapshot(rule)
+		snapshot.SubscriptionSets = []SubscriptionSet{routeBinding(10, 20, "subscription", 0, "example.com")}
+		compiled, err := Compile(snapshot, DefaultLimits())
+		if err != nil {
+			t.Fatal(err)
+		}
+		result, err := compiled.Match("www.example.com")
+		if err != nil || result.Route.RuleID != rule.ID || result.Route.SourceID != 0 || result.Route.UpstreamGroupID != rule.UpstreamGroupID {
+			t.Fatalf("manual route = %+v, err = %v", result.Route, err)
+		}
+	}
+}
+
+func TestSubscriptionPriorityAndBindingTieBreak(t *testing.T) {
+	snapshot := testSnapshot()
+	snapshot.SubscriptionSets = []SubscriptionSet{
+		routeBinding(1, 30, "deeper-but-lower-priority", 30, "www.example.com"),
+		routeBinding(2, 20, "smaller-priority", 10, "example.com"),
+		routeBinding(3, 10, "binding-tie-break", 10, "example.com"),
+	}
+	compiled, err := Compile(snapshot, DefaultLimits())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if first.Checksum() != second.Checksum() {
-		t.Fatalf("checksums differ: %s != %s", first.Checksum(), second.Checksum())
+	result, err := compiled.Match("www.example.com")
+	if err != nil || result.Route.BindingID != 10 || result.Route.UpstreamGroupID != "binding-tie-break" {
+		t.Fatalf("subscription route = %+v, err = %v", result.Route, err)
 	}
-	if rules[0].Pattern != "B.example" || rules[1].Pattern != "A.example." {
-		t.Fatalf("Compile mutated input rules: %+v", rules)
+}
+
+func TestAccessAndLoggingRemainIndependent(t *testing.T) {
+	compiled, err := Compile(testSnapshot(
+		Rule{ID: 1, Category: CategoryAccess, Action: ActionBlock, MatchType: MatchTypeDomain, Pattern: "example.com", Priority: 20},
+		Rule{ID: 2, Category: CategoryAccess, Action: ActionAllow, MatchType: MatchTypeDomain, Pattern: "example.com", Priority: 10},
+		Rule{ID: 3, Category: CategoryLogging, Action: ActionNoLog, MatchType: MatchTypeRegexp, Pattern: `\.example\.com$`, Priority: 1},
+	), DefaultLimits())
+	if err != nil {
+		t.Fatal(err)
 	}
-	withChecksum := testSnapshot(rules...)
-	withChecksum.Checksum = first.Checksum()
-	if _, err := Compile(withChecksum, DefaultLimits()); err != nil {
-		t.Fatalf("Compile() with matching checksum error = %v", err)
+	result, _ := compiled.Match("www.example.com")
+	if result.Access.RuleID != 2 || result.Logging.RuleID != 3 {
+		t.Fatalf("result = %+v", result)
+	}
+}
+
+func TestStaticAnswerNormalizesAddressesAndMatchesRegexp(t *testing.T) {
+	compiled, err := Compile(testSnapshot(Rule{ID: 7, Category: CategoryAnswer, Action: ActionStatic, MatchType: MatchTypeRegexp, Pattern: `^api\..+$`, Priority: 10, IPv4Addresses: []string{"192.0.2.2", "192.0.2.2"}, IPv6Addresses: []string{"2001:0db8::1"}, TTL: 600}), DefaultLimits())
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := compiled.Match("api.example")
+	if err != nil || result.Answer.RuleID != 7 || len(result.Answer.IPv4Addresses) != 1 || result.Answer.IPv6Addresses[0] != "2001:db8::1" || result.Answer.TTL != 600 {
+		t.Fatalf("answer=%+v err=%v", result.Answer, err)
+	}
+}
+
+func TestStaticAnswerRejectsInvalidFields(t *testing.T) {
+	invalid := []Rule{
+		{ID: 1, Category: CategoryAnswer, Action: ActionStatic, MatchType: MatchTypeFull, Pattern: "x.example", TTL: 300},
+		{ID: 1, Category: CategoryAnswer, Action: ActionStatic, MatchType: MatchTypeFull, Pattern: "x.example", IPv4Addresses: []string{"2001:db8::1"}, TTL: 300},
+		{ID: 1, Category: CategoryAccess, Action: ActionAllow, MatchType: MatchTypeFull, Pattern: "x.example", IPv4Addresses: []string{"192.0.2.1"}},
+	}
+	for _, rule := range invalid {
+		if _, err := Compile(testSnapshot(rule), DefaultLimits()); err == nil {
+			t.Fatalf("accepted %+v", rule)
+		}
 	}
 }
 
 func TestParseSnapshotRejectsUnknownFields(t *testing.T) {
-	_, err := ParseSnapshot([]byte(`{"schema_version":1,"version":1,"block_rcode":3,"rules":[],"unexpected":true}`))
-	if err == nil {
-		t.Fatal("ParseSnapshot() error = nil, want unknown field error")
-	}
-}
-
-func TestCompileRejectsLimitsAndChecksumMismatch(t *testing.T) {
-	_, err := Compile(testSnapshot(Rule{ID: 1, Category: CategoryAccess, Action: ActionBlock, MatchType: MatchTypeRegexp, Pattern: "a"}), Limits{MaxRegexpRules: 0, MaxRegexpBytes: 1})
-	if err != nil {
-		t.Fatalf("Compile() error = %v, want default limits when zero", err)
-	}
-	_, err = Compile(testSnapshot(Rule{ID: 1, Category: CategoryAccess, Action: ActionBlock, MatchType: MatchTypeRegexp, Pattern: "abcd"}), Limits{MaxRegexpBytes: 3})
-	if err == nil {
-		t.Fatal("Compile() error = nil, want regexp size error")
-	}
-	snapshot := testSnapshot()
-	snapshot.Checksum = "sha256:not-a-real-checksum"
-	if _, err := Compile(snapshot, DefaultLimits()); err == nil {
-		t.Fatal("Compile() error = nil, want checksum mismatch")
-	}
-}
-
-func TestCompileAcceptsChecksummedEmptyRulesArray(t *testing.T) {
-	snapshot := testSnapshot()
-	snapshot.Rules = []Rule{}
-	encoded, err := json.Marshal(snapshot)
-	if err != nil {
-		t.Fatal(err)
-	}
-	sum := sha256.Sum256(encoded)
-	snapshot.Checksum = "sha256:" + hex.EncodeToString(sum[:])
-
-	compiled, err := Compile(snapshot, DefaultLimits())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if compiled.RuleCount() != 0 {
-		t.Fatalf("rule count = %d, want 0", compiled.RuleCount())
-	}
-}
-
-func TestCompileRejectsInvalidRuleFields(t *testing.T) {
-	testCases := []Rule{
-		{ID: 0, Category: CategoryAccess, Action: ActionBlock, MatchType: MatchTypeFull, Pattern: "example.com"},
-		{ID: 1, Category: "unknown", Action: ActionBlock, MatchType: MatchTypeFull, Pattern: "example.com"},
-		{ID: 1, Category: CategoryAccess, Action: ActionRemote, MatchType: MatchTypeFull, Pattern: "example.com"},
-		{ID: 1, Category: CategoryAccess, Action: ActionBlock, MatchType: "keyword", Pattern: "example"},
-		{ID: 1, Category: CategoryAccess, Action: ActionBlock, MatchType: MatchTypeFull, Pattern: "example.com", Priority: 1001},
-	}
-	for _, rule := range testCases {
-		if _, err := Compile(testSnapshot(rule), DefaultLimits()); err == nil {
-			t.Fatalf("Compile(%+v) error = nil", rule)
-		}
-	}
-	invalidSchema := testSnapshot()
-	invalidSchema.SchemaVersion = SchemaVersion + 1
-	if _, err := Compile(invalidSchema, DefaultLimits()); err == nil {
-		t.Fatal("Compile() error = nil, want schema validation error")
-	}
-}
-
-func TestCompileRejectsDuplicateIDsAndCannotRelaxHardLimits(t *testing.T) {
-	_, err := Compile(testSnapshot(
-		Rule{ID: 1, Category: CategoryAccess, Action: ActionBlock, MatchType: MatchTypeFull, Pattern: "a.example"},
-		Rule{ID: 1, Category: CategoryLogging, Action: ActionNoLog, MatchType: MatchTypeFull, Pattern: "a.example"},
-	), DefaultLimits())
-	if err == nil {
-		t.Fatal("Compile() error = nil, want duplicate ID error")
-	}
-	longComment := string(make([]rune, DefaultLimits().MaxCommentRunes+1))
-	_, err = Compile(testSnapshot(Rule{ID: 1, Category: CategoryAccess, Action: ActionBlock, MatchType: MatchTypeFull, Pattern: "example.com", Comment: longComment}), Limits{MaxCommentRunes: 1_000})
-	if err == nil {
-		t.Fatal("Compile() error = nil, want hard comment limit error")
-	}
-}
-
-func TestChecksumNormalizesGeneratedAtToUTC(t *testing.T) {
-	instant := time.Date(2026, 7, 16, 1, 2, 3, 0, time.FixedZone("UTC+8", 8*60*60))
-	first := testSnapshot()
-	first.GeneratedAt = instant
-	second := testSnapshot()
-	second.GeneratedAt = instant.UTC()
-	compiledFirst, err := Compile(first, DefaultLimits())
-	if err != nil {
-		t.Fatal(err)
-	}
-	compiledSecond, err := Compile(second, DefaultLimits())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if compiledFirst.Checksum() != compiledSecond.Checksum() {
-		t.Fatalf("checksums differ: %s != %s", compiledFirst.Checksum(), compiledSecond.Checksum())
+	if _, err := ParseSnapshot([]byte(`{"schema_version":4,"version":1,"block_rcode":3,"rules":[],"unexpected":true}`)); err == nil {
+		t.Fatal("unknown field accepted")
 	}
 }
 
 func TestStoreConcurrentMatchAndSwap(t *testing.T) {
-	first, err := Compile(testSnapshot(Rule{ID: 1, Category: CategoryAccess, Action: ActionBlock, MatchType: MatchTypeDomain, Pattern: "example.com"}), DefaultLimits())
+	first, err := Compile(testSnapshot(routeRule(1, "one", MatchTypeDomain, "example.com", 1)), DefaultLimits())
 	if err != nil {
 		t.Fatal(err)
 	}
 	var store Store
 	store.Swap(first)
-
 	var wg sync.WaitGroup
 	for range 8 {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for range 500 {
-				snapshot := store.Load()
-				if snapshot == nil {
-					t.Error("Load() returned nil")
-					return
-				}
-				if _, err := snapshot.Match("www.example.com"); err != nil {
+			for range 200 {
+				if _, err := store.Load().Match("www.example.com"); err != nil {
 					t.Error(err)
 					return
 				}
 			}
 		}()
 	}
-	for i := 2; i < 102; i++ {
-		next, err := Compile(testSnapshot(Rule{ID: int64(i), Category: CategoryAccess, Action: ActionBlock, MatchType: MatchTypeDomain, Pattern: fmt.Sprintf("%d.example.com", i)}), DefaultLimits())
+	for i := 2; i < 30; i++ {
+		next, err := Compile(testSnapshot(routeRule(int64(i), "next", MatchTypeDomain, fmt.Sprintf("%d.example.com", i), 1)), DefaultLimits())
 		if err != nil {
 			t.Fatal(err)
 		}

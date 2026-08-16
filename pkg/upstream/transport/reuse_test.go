@@ -21,6 +21,7 @@ package transport
 
 import (
 	"context"
+	"net"
 	"sync"
 	"testing"
 	"time"
@@ -151,4 +152,24 @@ func Test_ReuseConnTransport_conn_lose_and_close(t *testing.T) {
 	// connection should be closed and removed
 	r.Equal(0, connNum)
 	r.Equal(0, idledConnNum)
+}
+
+func TestReusableConnUsesContextDeadline(t *testing.T) {
+	client, server := net.Pipe()
+	defer server.Close()
+	transport := NewReuseConnTransport(ReuseConnOpts{DialContext: func(context.Context) (NetConn, error) { return client, nil }})
+	defer transport.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Millisecond)
+	defer cancel()
+	query := new(dns.Msg)
+	query.SetQuestion("deadline.example.", dns.TypeA)
+	payload, err := query.Pack()
+	require.NoError(t, err)
+	started := time.Now()
+	_, err = transport.ExchangeContext(ctx, payload)
+	require.Error(t, err)
+	if elapsed := time.Since(started); elapsed > 250*time.Millisecond {
+		t.Fatalf("context deadline took %s", elapsed)
+	}
 }

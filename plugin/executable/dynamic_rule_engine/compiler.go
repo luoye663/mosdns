@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/netip"
 	"regexp"
 	"sort"
 	"strings"
@@ -14,7 +15,7 @@ import (
 	"unicode/utf8"
 )
 
-const categoryCount = 3
+const categoryCount = 4
 
 type compiledRegex struct {
 	re       *regexp.Regexp
@@ -40,6 +41,7 @@ type CompiledSnapshot struct {
 	domain        [categoryCount]map[string]MatchedRule
 	regex         []compiledRegex
 	subscriptions [categoryCount][]compiledSubscriptionSet
+	routeBindings map[string]MatchedRule
 }
 
 func (s *CompiledSnapshot) SchemaVersion() uint32 { return s.schemaVersion }
@@ -53,7 +55,7 @@ func (s *CompiledSnapshot) LoadedAt() time.Time   { return s.loadedAt }
 // Compile 在 DNS 请求路径外执行全部校验和索引构建。
 func Compile(snapshot Snapshot, limits Limits) (*CompiledSnapshot, error) {
 	limits = normalizeLimits(limits)
-	if snapshot.SchemaVersion != 1 && snapshot.SchemaVersion != SchemaVersion {
+	if snapshot.SchemaVersion != SchemaVersion && snapshot.SchemaVersion != LegacySchemaVersion {
 		return nil, fmt.Errorf("schema_version %d is unsupported", snapshot.SchemaVersion)
 	}
 	if snapshot.Version == 0 {
@@ -93,9 +95,6 @@ func Compile(snapshot Snapshot, limits Limits) (*CompiledSnapshot, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := validateSubscriptionRouteConflicts(normalizedRules, normalizedSets); err != nil {
-		return nil, err
-	}
 
 	checksum, canonicalRules, err := checksumSnapshot(snapshot, normalizedRules, normalizedSets)
 	if err != nil {
@@ -113,6 +112,7 @@ func Compile(snapshot Snapshot, limits Limits) (*CompiledSnapshot, error) {
 		ruleCount:     len(canonicalRules),
 		regexpCount:   regexpCount,
 		loadedAt:      time.Now().UTC(),
+		routeBindings: make(map[string]MatchedRule),
 	}
 	for i := range compiled.full {
 		compiled.full[i] = make(map[string]MatchedRule)
@@ -132,14 +132,28 @@ func Compile(snapshot Snapshot, limits Limits) (*CompiledSnapshot, error) {
 
 func normalizeSubscriptionSets(sets []SubscriptionSet, limits Limits) ([]SubscriptionSet, error) {
 	result := make([]SubscriptionSet, len(sets))
-	seen := make(map[int64]struct{}, len(sets))
+	seenSources := make(map[int64]struct{}, len(sets))
+	seenBindings := make(map[int64]struct{}, len(sets))
 	for i, set := range sets {
-		if _, exists := seen[set.SourceID]; exists {
+		if _, exists := seenSources[set.SourceID]; exists {
 			return nil, fmt.Errorf("duplicate subscription set %d", set.SourceID)
 		}
-		seen[set.SourceID] = struct{}{}
+		seenSources[set.SourceID] = struct{}{}
+		if set.BindingID != 0 {
+			if _, exists := seenBindings[set.BindingID]; exists {
+				return nil, fmt.Errorf("duplicate subscription binding %d", set.BindingID)
+			}
+			seenBindings[set.BindingID] = struct{}{}
+		}
 		category, ok := categoryIndex(set.Category)
-		if !ok || category < 0 || !validAction(set.Category, set.Action) || set.SourceID <= 0 || set.SourceName == "" || set.Priority < 0 || set.Priority > 1000 || len(set.Domains) == 0 {
+		validSubscriptionAction := validAction(set.Category, set.Action)
+		if set.Category == CategoryRoute {
+			validSubscriptionAction = set.Action == ActionUpstream && set.BindingID > 0 && validUpstreamGroupID(set.UpstreamGroupID)
+		}
+		if set.Category != CategoryRoute && (set.BindingID != 0 || set.UpstreamGroupID != "") {
+			validSubscriptionAction = false
+		}
+		if !ok || category < 0 || !validSubscriptionAction || set.SourceID <= 0 || set.SourceName == "" || set.Priority < 0 || set.Priority > 1000 || len(set.Domains) == 0 {
 			return nil, fmt.Errorf("invalid subscription set %d", set.SourceID)
 		}
 		domains := make([]string, len(set.Domains))
@@ -166,7 +180,15 @@ func normalizeSubscriptionSets(sets []SubscriptionSet, limits Limits) ([]Subscri
 func (s *CompiledSnapshot) addSubscriptionSets(sets []SubscriptionSet, limits Limits) error {
 	for _, set := range sets {
 		category, _ := categoryIndex(set.Category)
-		s.subscriptions[category] = append(s.subscriptions[category], compiledSubscriptionSet{match: MatchedRule{RuleID: set.SourceID, Action: set.Action, MatchType: MatchTypeDomain, Priority: set.Priority, SourceID: set.SourceID, SourceName: set.SourceName}, domains: set.Domains})
+		match := MatchedRule{RuleID: set.SourceID, Action: set.Action, MatchType: MatchTypeDomain, Priority: set.Priority, SourceID: set.SourceID, SourceName: set.SourceName, BindingID: set.BindingID, UpstreamGroupID: set.UpstreamGroupID}
+		if category == categoryRoute {
+			for _, domain := range set.Domains {
+				match.Pattern = domain
+				s.routeBindings[domain] = preferredBinding(match, s.routeBindings[domain])
+			}
+			continue
+		}
+		s.subscriptions[category] = append(s.subscriptions[category], compiledSubscriptionSet{match: match, domains: set.Domains})
 	}
 	return nil
 }
@@ -178,33 +200,12 @@ func subscriptionDomainCount(sets []SubscriptionSet) int {
 	return total
 }
 
-func validateSubscriptionRouteConflicts(rules []Rule, sets []SubscriptionSet) error {
-	seen := map[string]string{}
-	for _, rule := range rules {
-		if rule.Category == CategoryRoute && rule.MatchType == MatchTypeDomain {
-			seen[rule.Pattern+"\x00"+fmt.Sprint(rule.Priority)] = rule.Action
-		}
-	}
-	for _, set := range sets {
-		if set.Category != CategoryRoute {
-			continue
-		}
-		for _, domain := range set.Domains {
-			key := domain + "\x00" + fmt.Sprint(set.Priority)
-			if action, exists := seen[key]; exists && action != set.Action {
-				return fmt.Errorf("route conflict for subscription domain %q", domain)
-			}
-			seen[key] = set.Action
-		}
-	}
-	return nil
-}
-
 func (s *CompiledSnapshot) addRule(rule Rule) error {
 	category, _ := categoryIndex(rule.Category)
 	match := MatchedRule{
 		RuleID: rule.ID, Action: rule.Action, MatchType: rule.MatchType,
-		Pattern: rule.Pattern, Priority: rule.Priority,
+		Pattern: rule.Pattern, Priority: rule.Priority, UpstreamGroupID: rule.UpstreamGroupID,
+		IPv4Addresses: rule.IPv4Addresses, IPv6Addresses: rule.IPv6Addresses, TTL: rule.TTL,
 	}
 	switch rule.MatchType {
 	case MatchTypeFull:
@@ -230,20 +231,18 @@ func (s *CompiledSnapshot) Match(qname string) (MatchResult, error) {
 	result.Access = s.matchCategory(normalized, categoryAccess)
 	result.Route = s.matchCategory(normalized, categoryRoute)
 	result.Logging = s.matchCategory(normalized, categoryLogging)
+	result.Answer = s.matchCategory(normalized, categoryAnswer)
 	return result, nil
 }
 
 func (s *CompiledSnapshot) matchCategory(qname string, category int) MatchedRule {
-	if match, ok := s.full[category][qname]; ok {
-		return match
-	}
 	var best MatchedRule
-	// A flat suffix table avoids one map allocation per domain label while
-	// retaining the deepest-domain-first matching semantics of the old trie.
+	if match, ok := s.full[category][qname]; ok {
+		best = preferred(match, best, category)
+	}
 	for suffix := qname; suffix != ""; {
 		if match, ok := s.domain[category][suffix]; ok {
-			best = match
-			break
+			best = preferred(match, best, category)
 		}
 		separator := strings.IndexByte(suffix, '.')
 		if separator < 0 {
@@ -251,18 +250,35 @@ func (s *CompiledSnapshot) matchCategory(qname string, category int) MatchedRule
 		}
 		suffix = suffix[separator+1:]
 	}
-	for _, set := range s.subscriptions[category] {
-		if subscriptionMatches(set.domains, qname) {
-			best = preferred(set.match, best, category)
+	if category != categoryRoute {
+		for _, set := range s.subscriptions[category] {
+			if subscriptionMatches(set.domains, qname) {
+				best = preferred(set.match, best, category)
+			}
 		}
-	}
-	if best.Matched() {
-		return best
 	}
 	for _, rule := range s.regex {
 		if rule.category == category && rule.re.MatchString(qname) {
 			best = preferred(rule.match, best, category)
 		}
+	}
+	if !best.Matched() && category == categoryRoute {
+		return s.matchRouteBinding(qname)
+	}
+	return best
+}
+
+func (s *CompiledSnapshot) matchRouteBinding(qname string) MatchedRule {
+	var best MatchedRule
+	for suffix := qname; suffix != ""; {
+		if match, ok := s.routeBindings[suffix]; ok {
+			best = preferredBinding(match, best)
+		}
+		separator := strings.IndexByte(suffix, '.')
+		if separator < 0 {
+			break
+		}
+		suffix = suffix[separator+1:]
 	}
 	return best
 }
@@ -312,6 +328,30 @@ func normalizeRule(rule Rule, limits Limits) (Rule, bool, error) {
 	if !validAction(rule.Category, rule.Action) {
 		return Rule{}, false, fmt.Errorf("action %q is invalid for category %q", rule.Action, rule.Category)
 	}
+	if rule.Category == CategoryRoute {
+		if rule.Action != ActionUpstream || !validUpstreamGroupID(rule.UpstreamGroupID) {
+			return Rule{}, false, fmt.Errorf("route rule requires action upstream and a valid upstream_group_id")
+		}
+	} else if rule.UpstreamGroupID != "" {
+		return Rule{}, false, fmt.Errorf("upstream_group_id is only valid for route rules")
+	}
+	if rule.Category == CategoryAnswer {
+		if rule.TTL < 1 || rule.TTL > 86400 {
+			return Rule{}, false, fmt.Errorf("ttl must be within 1..86400")
+		}
+		var err error
+		if rule.IPv4Addresses, err = normalizeAddresses(rule.IPv4Addresses, true); err != nil {
+			return Rule{}, false, err
+		}
+		if rule.IPv6Addresses, err = normalizeAddresses(rule.IPv6Addresses, false); err != nil {
+			return Rule{}, false, err
+		}
+		if len(rule.IPv4Addresses)+len(rule.IPv6Addresses) == 0 {
+			return Rule{}, false, fmt.Errorf("static answer requires at least one address")
+		}
+	} else if len(rule.IPv4Addresses) != 0 || len(rule.IPv6Addresses) != 0 || rule.TTL != 0 {
+		return Rule{}, false, fmt.Errorf("address fields are only valid for answer rules")
+	}
 	if rule.Priority < 0 || rule.Priority > 1000 {
 		return Rule{}, false, fmt.Errorf("priority %d is outside 0..1000", rule.Priority)
 	}
@@ -351,6 +391,8 @@ func categoryIndex(category string) (int, bool) {
 		return categoryRoute, true
 	case CategoryLogging:
 		return categoryLogging, true
+	case CategoryAnswer:
+		return categoryAnswer, true
 	default:
 		return 0, false
 	}
@@ -360,6 +402,7 @@ const (
 	categoryAccess = iota
 	categoryRoute
 	categoryLogging
+	categoryAnswer
 )
 
 func validAction(category, action string) bool {
@@ -367,20 +410,61 @@ func validAction(category, action string) bool {
 	case CategoryAccess:
 		return action == ActionAllow || action == ActionBlock
 	case CategoryRoute:
-		return action == ActionLocal || action == ActionRemote
+		return action == ActionUpstream
 	case CategoryLogging:
 		return action == ActionNoLog
+	case CategoryAnswer:
+		return action == ActionStatic
 	default:
 		return false
 	}
 }
 
-// preferred 按 priority 和规格定义的同级语义选择唯一且确定的记录。
-func preferred(candidate, current MatchedRule, category int) MatchedRule {
-	if !current.Matched() || candidate.Priority > current.Priority {
+func normalizeAddresses(values []string, want4 bool) ([]string, error) {
+	if len(values) > 16 {
+		return nil, fmt.Errorf("address family exceeds 16 entries")
+	}
+	seen := make(map[string]struct{}, len(values))
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		addr, err := netip.ParseAddr(strings.TrimSpace(value))
+		if err != nil || addr.Is4() != want4 {
+			family := 6
+			if want4 {
+				family = 4
+			}
+			return nil, fmt.Errorf("invalid IPv%d address %q", family, value)
+		}
+		normalized := addr.String()
+		if _, ok := seen[normalized]; ok {
+			continue
+		}
+		seen[normalized] = struct{}{}
+		out = append(out, normalized)
+	}
+	sort.Strings(out)
+	return out, nil
+}
+
+var upstreamGroupIDRegexp = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,63}$`)
+
+func validUpstreamGroupID(groupID string) bool {
+	return upstreamGroupIDRegexp.MatchString(groupID)
+}
+
+func preferredBinding(candidate, current MatchedRule) MatchedRule {
+	if !current.Matched() || candidate.Priority < current.Priority || candidate.Priority == current.Priority && candidate.BindingID < current.BindingID {
 		return candidate
 	}
-	if candidate.Priority < current.Priority {
+	return current
+}
+
+// preferred 按 priority 和规格定义的同级语义选择唯一且确定的记录。
+func preferred(candidate, current MatchedRule, category int) MatchedRule {
+	if !current.Matched() || candidate.Priority < current.Priority {
+		return candidate
+	}
+	if candidate.Priority > current.Priority {
 		return current
 	}
 	if category == categoryAccess && candidate.Action == ActionAllow && current.Action == ActionBlock {
@@ -403,10 +487,11 @@ func validateRouteConflicts(rules []Rule) error {
 			continue
 		}
 		key := strings.Join([]string{rule.MatchType, rule.Pattern, fmt.Sprint(rule.Priority)}, "\x00")
-		if action, ok := seen[key]; ok && action != rule.Action {
+		effect := rule.Action + "\x00" + rule.UpstreamGroupID
+		if action, ok := seen[key]; ok && action != effect {
 			return fmt.Errorf("route conflict for %s pattern %q at priority %d", rule.MatchType, rule.Pattern, rule.Priority)
 		}
-		seen[key] = rule.Action
+		seen[key] = effect
 	}
 	return nil
 }
@@ -426,17 +511,48 @@ func checksumSnapshot(snapshot Snapshot, rules []Rule, sets []SubscriptionSet) (
 			return a.Pattern < b.Pattern
 		}
 		if a.Priority != b.Priority {
-			return a.Priority > b.Priority
+			return a.Priority < b.Priority
 		}
 		return a.ID < b.ID
 	})
-	canonical := Snapshot{SchemaVersion: snapshot.SchemaVersion, Version: snapshot.Version, ExpectedCurrentVersion: snapshot.ExpectedCurrentVersion, GeneratedAt: snapshot.GeneratedAt.UTC(), BlockRCode: snapshot.BlockRCode, Rules: rules, SubscriptionSets: sets}
+	canonicalSets := make([]canonicalSubscriptionSetV4, len(sets))
+	for i, set := range sets {
+		canonicalSets[i] = canonicalSubscriptionSetV4{
+			SourceID: set.SourceID, SourceName: set.SourceName, Category: set.Category, Action: set.Action,
+			BindingID: set.BindingID, UpstreamGroupID: set.UpstreamGroupID, Priority: set.Priority, Domains: set.Domains,
+		}
+	}
+	canonical := canonicalSnapshotV4{
+		SchemaVersion: snapshot.SchemaVersion, Version: snapshot.Version, ExpectedCurrentVersion: snapshot.ExpectedCurrentVersion,
+		GeneratedAt: snapshot.GeneratedAt.UTC(), BlockRCode: snapshot.BlockRCode, Rules: rules, SubscriptionSets: canonicalSets,
+	}
 	b, err := json.Marshal(canonical)
 	if err != nil {
 		return "", nil, fmt.Errorf("marshal canonical snapshot: %w", err)
 	}
 	sum := sha256.Sum256(b)
 	return "sha256:" + hex.EncodeToString(sum[:]), rules, nil
+}
+
+type canonicalSnapshotV4 struct {
+	SchemaVersion          uint32                       `json:"schema_version"`
+	Version                uint64                       `json:"version"`
+	ExpectedCurrentVersion uint64                       `json:"expected_current_version"`
+	GeneratedAt            time.Time                    `json:"generated_at"`
+	BlockRCode             int                          `json:"block_rcode"`
+	Rules                  []Rule                       `json:"rules"`
+	SubscriptionSets       []canonicalSubscriptionSetV4 `json:"subscription_sets"`
+}
+
+type canonicalSubscriptionSetV4 struct {
+	SourceID        int64    `json:"source_id"`
+	SourceName      string   `json:"source_name"`
+	Category        string   `json:"category"`
+	Action          string   `json:"action"`
+	BindingID       int64    `json:"binding_id,omitempty"`
+	UpstreamGroupID string   `json:"upstream_group_id,omitempty"`
+	Priority        int      `json:"priority"`
+	Domains         []string `json:"domains"`
 }
 
 // ParseSnapshot 使用严格 decoder，避免 API 层接受拼写错误或未定义字段。

@@ -3,6 +3,7 @@ package query_audit
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -16,6 +17,7 @@ import (
 
 	"github.com/IrineSistiana/mosdns/v5/coremain"
 	"github.com/IrineSistiana/mosdns/v5/pkg/query_context"
+	"github.com/IrineSistiana/mosdns/v5/plugin/executable/dynamic_rule_engine"
 	fastforward "github.com/IrineSistiana/mosdns/v5/plugin/executable/forward"
 	"github.com/IrineSistiana/mosdns/v5/plugin/executable/sequence"
 	"github.com/miekg/dns"
@@ -62,6 +64,39 @@ func testContext(name string) *query_context.Context {
 	qCtx.ServerMeta.ClientAddr = netip.MustParseAddr("192.168.1.23")
 	qCtx.ServerMeta.FromUDP = true
 	return qCtx
+}
+
+func execRuleSnapshot(t *testing.T, snapshot dynamic_rule_engine.Snapshot, qCtx *query_context.Context) {
+	t.Helper()
+	dir := t.TempDir()
+	tokenFile := filepath.Join(dir, "rule-token")
+	snapshotFile := filepath.Join(dir, "rules.json")
+	if err := os.WriteFile(tokenFile, []byte("rule-token"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	data, err := json.Marshal(snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(snapshotFile, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	m := coremain.NewTestMosdnsWithPlugins(nil)
+	raw, err := dynamic_rule_engine.Init(coremain.NewBP("audit-rule-snapshot", m), &dynamic_rule_engine.Args{
+		SnapshotFile: snapshotFile, BackupFile: filepath.Join(dir, "rules.bak"), AuthTokenFile: tokenFile,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	engine := raw.(*dynamic_rule_engine.Plugin)
+	t.Cleanup(func() { _ = engine.Close() })
+	if err := engine.Exec(t.Context(), qCtx); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func auditMarksWithoutLegacySubscriptions() Marks {
+	return Marks{AccessBlock: 1001, NoLog: 1201, CacheHit: 2101}
 }
 
 func TestExecObservesRejectAndCacheMark(t *testing.T) {
@@ -128,7 +163,7 @@ func TestExecObservesGotoAndAccept(t *testing.T) {
 	}
 	select {
 	case event := <-events:
-		if event.QName != "goto.example" || event.RCode != dns.RcodeSuccess || event.Route != "remote" {
+		if event.QName != "goto.example" || event.RCode != dns.RcodeSuccess || event.Route != "forward" || event.SchemaVersion != eventSchemaVersion {
 			t.Fatalf("goto/accept event = %+v", event)
 		}
 	case <-time.After(time.Second):
@@ -174,28 +209,34 @@ func TestBuildEventOmitsMinimumTTLWithoutAnswer(t *testing.T) {
 	}
 }
 
-func TestRouteMarksFromFinalSequenceUseDefaultSource(t *testing.T) {
+func TestBuildEventClassifiesConcurrencyLimits(t *testing.T) {
 	p := newTestAuditPlugin(t, "http://127.0.0.1:1", 1, 1)
 	defer p.Close()
 
 	for _, test := range []struct {
-		name       string
-		mark       uint32
-		wantRoute  string
-		wantSource string
-		wantGroup  string
+		name, code string
+		info       query_context.OverloadInfo
 	}{
-		{name: "remote", mark: p.marks.RouteRemote, wantRoute: "remote", wantSource: "default", wantGroup: "remote_dns"},
-		{name: "local", mark: p.marks.RouteLocal, wantRoute: "local", wantSource: "default", wantGroup: "local_dns"},
+		{name: "global", code: "DNS_CONCURRENCY_LIMIT_GLOBAL", info: query_context.OverloadInfo{Scope: query_context.OverloadScopeGlobal, Limit: 32}},
+		{name: "group", code: "DNS_CONCURRENCY_LIMIT_GROUP", info: query_context.OverloadInfo{Scope: query_context.OverloadScopeGroup, GroupID: "default", Limit: 16}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			qCtx := testContext(test.name + ".example")
-			qCtx.SetMark(test.mark)
-			route, source, group := p.route(qCtx)
-			if route != test.wantRoute || source != test.wantSource || group != test.wantGroup {
-				t.Fatalf("route() = (%q, %q, %q), want (%q, %q, %q)", route, source, group, test.wantRoute, test.wantSource, test.wantGroup)
+			qCtx := testContext(test.name + "-overload.example")
+			query_context.SetOverloadInfo(qCtx, test.info)
+			event := p.buildEvent(qCtx, time.Now(), errors.New("DNS concurrency limit reached"))
+			if event.ErrorCode != test.code || event.ErrorText != "DNS concurrency limit reached" {
+				t.Fatalf("overload event = %+v", event)
 			}
 		})
+	}
+}
+
+func TestRouteDefaultsToForward(t *testing.T) {
+	p := newTestAuditPlugin(t, "http://127.0.0.1:1", 1, 1)
+	defer p.Close()
+	route, source, group := p.route(testContext("default.example"))
+	if route != "forward" || source != "default" || group != "" {
+		t.Fatalf("route() = (%q, %q, %q)", route, source, group)
 	}
 }
 
@@ -241,6 +282,123 @@ func TestBuildEventReportsSelectedUpstreamTag(t *testing.T) {
 	event := p.buildEvent(qCtx, time.Now(), nil)
 	if event.UpstreamTag != "audit-upstream" {
 		t.Fatalf("upstream tag = %q, want audit-upstream", event.UpstreamTag)
+	}
+}
+
+func TestBuildEventPrefersRegistryMetadata(t *testing.T) {
+	p := newTestAuditPlugin(t, "http://127.0.0.1:1", 1, 1)
+	defer p.Close()
+	qCtx := testContext("registry.example")
+	query_context.SetUpstreamRuntimeMeta(qCtx, query_context.UpstreamRuntimeMeta{GroupID: "custom", GroupName: "Custom", RouteSource: "subscription", UpstreamTag: "selected", CacheHit: true})
+	event := p.buildEvent(qCtx, time.Now(), nil)
+	if event.Route != "forward" || event.RouteSource != "subscription" || event.UpstreamGroup != "custom" || event.UpstreamTag != "selected" || !event.CacheHit {
+		t.Fatalf("registry audit event = %+v", event)
+	}
+}
+
+func TestBuildEventIncludesSubscriptionBindingAndActualRegistryGroup(t *testing.T) {
+	dir := t.TempDir()
+	tokenFile := filepath.Join(dir, "rule-token")
+	snapshotFile := filepath.Join(dir, "rules.json")
+	if err := os.WriteFile(tokenFile, []byte("rule-token"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	snapshot := dynamic_rule_engine.Snapshot{
+		SchemaVersion: dynamic_rule_engine.SchemaVersion,
+		Version:       1,
+		BlockRCode:    dns.RcodeNameError,
+		Rules:         []dynamic_rule_engine.Rule{},
+		SubscriptionSets: []dynamic_rule_engine.SubscriptionSet{{
+			SourceID: 7, SourceName: "bound-source", BindingID: 11, UpstreamGroupID: "requested_group",
+			Category: dynamic_rule_engine.CategoryRoute, Action: dynamic_rule_engine.ActionUpstream, Priority: 1, Domains: []string{"audit.example"},
+		}},
+	}
+	data, err := json.Marshal(snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(snapshotFile, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	m := coremain.NewTestMosdnsWithPlugins(nil)
+	raw, err := dynamic_rule_engine.Init(coremain.NewBP("audit-binding-rules", m), &dynamic_rule_engine.Args{
+		SnapshotFile: snapshotFile, BackupFile: filepath.Join(dir, "rules.bak"), AuthTokenFile: tokenFile,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	engine := raw.(*dynamic_rule_engine.Plugin)
+	defer engine.Close()
+
+	qCtx := testContext("www.audit.example")
+	if err := engine.Exec(t.Context(), qCtx); err != nil {
+		t.Fatal(err)
+	}
+	query_context.SetUpstreamRuntimeMeta(qCtx, query_context.UpstreamRuntimeMeta{GroupID: "actual_group", GroupName: "Actual", RouteSource: "subscription"})
+	p := newTestAuditPlugin(t, "http://127.0.0.1:1", 1, 1)
+	defer p.Close()
+	event := p.buildEvent(qCtx, time.Now(), nil)
+	if event.SubscriptionBindingID != 11 || event.SubscriptionSourceID != 7 || event.SubscriptionSourceName != "bound-source" || event.UpstreamGroup != "actual_group" || event.RouteSource != "subscription" {
+		t.Fatalf("binding audit event = %+v", event)
+	}
+}
+
+func TestAccessSubscriptionAuditWithoutLegacyMarks(t *testing.T) {
+	for _, action := range []string{dynamic_rule_engine.ActionAllow, dynamic_rule_engine.ActionBlock} {
+		t.Run(action, func(t *testing.T) {
+			qCtx := testContext(action + ".audit.example")
+			execRuleSnapshot(t, dynamic_rule_engine.Snapshot{
+				SchemaVersion: dynamic_rule_engine.SchemaVersion, Version: 1, BlockRCode: dns.RcodeNameError, Rules: []dynamic_rule_engine.Rule{},
+				SubscriptionSets: []dynamic_rule_engine.SubscriptionSet{{SourceID: 21, SourceName: "access-source", Category: dynamic_rule_engine.CategoryAccess, Action: action, Priority: 10, Domains: []string{"audit.example"}}},
+			}, qCtx)
+
+			p := newTestAuditPlugin(t, "http://127.0.0.1:1", 1, 1)
+			defer p.Close()
+			p.marks = auditMarksWithoutLegacySubscriptions()
+			event := p.buildEvent(qCtx, time.Now(), nil)
+			if event.SubscriptionSourceID != 21 || event.SubscriptionSourceName != "access-source" || len(event.SubscriptionCategories) != 1 || event.SubscriptionCategories[0] != "access" {
+				t.Fatalf("%s access audit event = %+v", action, event)
+			}
+			if action == dynamic_rule_engine.ActionBlock && (event.Route != "block" || event.RouteSource != "subscription") {
+				t.Fatalf("block route audit event = %+v", event)
+			}
+		})
+	}
+}
+
+func TestAccessAndRouteSubscriptionsAuditBothCategories(t *testing.T) {
+	qCtx := testContext("combined.audit.example")
+	execRuleSnapshot(t, dynamic_rule_engine.Snapshot{
+		SchemaVersion: dynamic_rule_engine.SchemaVersion, Version: 1, BlockRCode: dns.RcodeNameError, Rules: []dynamic_rule_engine.Rule{},
+		SubscriptionSets: []dynamic_rule_engine.SubscriptionSet{
+			{SourceID: 21, SourceName: "access-source", Category: dynamic_rule_engine.CategoryAccess, Action: dynamic_rule_engine.ActionAllow, Priority: 10, Domains: []string{"audit.example"}},
+			{SourceID: 22, SourceName: "route-source", BindingID: 31, UpstreamGroupID: "requested_group", Category: dynamic_rule_engine.CategoryRoute, Action: dynamic_rule_engine.ActionUpstream, Priority: 10, Domains: []string{"audit.example"}},
+		},
+	}, qCtx)
+	query_context.SetUpstreamRuntimeMeta(qCtx, query_context.UpstreamRuntimeMeta{GroupID: "actual_group", RouteSource: "subscription"})
+	p := newTestAuditPlugin(t, "http://127.0.0.1:1", 1, 1)
+	defer p.Close()
+	p.marks = auditMarksWithoutLegacySubscriptions()
+	event := p.buildEvent(qCtx, time.Now(), nil)
+	if event.SubscriptionSourceID != 22 || event.SubscriptionSourceName != "route-source" || event.SubscriptionBindingID != 31 || len(event.SubscriptionCategories) != 2 || event.SubscriptionCategories[0] != "access" || event.SubscriptionCategories[1] != "route" {
+		t.Fatalf("combined subscription audit event = %+v", event)
+	}
+}
+
+func TestBlockedAccessSubscriptionDoesNotAttributeUnusedRoute(t *testing.T) {
+	qCtx := testContext("blocked.audit.example")
+	execRuleSnapshot(t, dynamic_rule_engine.Snapshot{
+		SchemaVersion: dynamic_rule_engine.SchemaVersion, Version: 1, BlockRCode: dns.RcodeNameError, Rules: []dynamic_rule_engine.Rule{},
+		SubscriptionSets: []dynamic_rule_engine.SubscriptionSet{
+			{SourceID: 21, SourceName: "access-source", Category: dynamic_rule_engine.CategoryAccess, Action: dynamic_rule_engine.ActionBlock, Priority: 10, Domains: []string{"audit.example"}},
+			{SourceID: 22, SourceName: "route-source", BindingID: 31, UpstreamGroupID: "unused_group", Category: dynamic_rule_engine.CategoryRoute, Action: dynamic_rule_engine.ActionUpstream, Priority: 10, Domains: []string{"audit.example"}},
+		},
+	}, qCtx)
+	p := newTestAuditPlugin(t, "http://127.0.0.1:1", 1, 1)
+	defer p.Close()
+	event := p.buildEvent(qCtx, time.Now(), nil)
+	if event.Route != "block" || event.SubscriptionSourceID != 21 || event.SubscriptionSourceName != "access-source" || event.SubscriptionBindingID != 0 || len(event.SubscriptionCategories) != 1 || event.SubscriptionCategories[0] != "access" {
+		t.Fatalf("blocked subscription audit event = %+v", event)
 	}
 }
 

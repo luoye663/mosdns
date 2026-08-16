@@ -54,10 +54,11 @@ func apiRequest(t *testing.T, p *Plugin, method, path string, body any, token st
 	return recorder
 }
 
-func phase3Snapshot(version, expected uint64) Snapshot {
+func phase4Snapshot(version, expected uint64) Snapshot {
 	return Snapshot{
 		SchemaVersion: SchemaVersion, Version: version, ExpectedCurrentVersion: expected, BlockRCode: dns.RcodeNameError,
-		Rules: []Rule{{ID: int64(version), Category: CategoryAccess, Action: ActionBlock, MatchType: MatchTypeFull, Pattern: "blocked.example"}},
+		Rules:            []Rule{{ID: int64(version), Category: CategoryAccess, Action: ActionBlock, MatchType: MatchTypeFull, Pattern: "blocked.example"}},
+		SubscriptionSets: []SubscriptionSet{routeBinding(1000+int64(version), int64(version), "published_group", 1, "blocked.example")},
 	}
 }
 
@@ -66,7 +67,7 @@ func TestAPIAuthenticationApplyAndStatusReconcile(t *testing.T) {
 	if response := apiRequest(t, p, http.MethodGet, "/status", nil, "wrong"); response.Code != http.StatusUnauthorized {
 		t.Fatalf("wrong token status = %d", response.Code)
 	}
-	if response := apiRequest(t, p, http.MethodPut, "/snapshot", phase3Snapshot(1, 0), "test-token"); response.Code != http.StatusOK {
+	if response := apiRequest(t, p, http.MethodPut, "/snapshot", phase4Snapshot(1, 0), "test-token"); response.Code != http.StatusOK {
 		t.Fatalf("apply status = %d, body = %s", response.Code, response.Body.String())
 	}
 	// 模拟 controller 在收到响应前断开后，通过 status 对账已发布版本。
@@ -85,7 +86,7 @@ func TestAPIAuthenticationApplyAndStatusReconcile(t *testing.T) {
 
 func TestAPIRejectsUnknownJSONFields(t *testing.T) {
 	p, _ := newTestPlugin(t, true)
-	req := httptest.NewRequest(http.MethodPost, "/validate", bytes.NewBufferString(`{"schema_version":1,"version":1,"block_rcode":3,"rules":[],"typo":true}`))
+	req := httptest.NewRequest(http.MethodPost, "/validate", bytes.NewBufferString(`{"schema_version":4,"version":1,"block_rcode":3,"rules":[],"typo":true}`))
 	req.Header.Set("Authorization", "Bearer test-token")
 	recorder := httptest.NewRecorder()
 	p.router().ServeHTTP(recorder, req)
@@ -96,14 +97,14 @@ func TestAPIRejectsUnknownJSONFields(t *testing.T) {
 
 func TestAPIVersionConflictAndPersistFailureDoNotSwap(t *testing.T) {
 	p, _ := newTestPlugin(t, true)
-	if response := apiRequest(t, p, http.MethodPut, "/snapshot", phase3Snapshot(1, 0), "test-token"); response.Code != http.StatusOK {
+	if response := apiRequest(t, p, http.MethodPut, "/snapshot", phase4Snapshot(1, 0), "test-token"); response.Code != http.StatusOK {
 		t.Fatalf("initial apply = %d: %s", response.Code, response.Body.String())
 	}
-	if response := apiRequest(t, p, http.MethodPut, "/snapshot", phase3Snapshot(2, 0), "test-token"); response.Code != http.StatusConflict {
+	if response := apiRequest(t, p, http.MethodPut, "/snapshot", phase4Snapshot(2, 0), "test-token"); response.Code != http.StatusConflict {
 		t.Fatalf("conflict status = %d", response.Code)
 	}
 	p.persist = func(Snapshot) error { return errors.New("disk unavailable") }
-	if response := apiRequest(t, p, http.MethodPut, "/snapshot", phase3Snapshot(2, 1), "test-token"); response.Code != http.StatusInternalServerError {
+	if response := apiRequest(t, p, http.MethodPut, "/snapshot", phase4Snapshot(2, 1), "test-token"); response.Code != http.StatusInternalServerError {
 		t.Fatalf("persist failure status = %d", response.Code)
 	}
 	if current := p.store.Load(); current == nil || current.Version() != 1 {
@@ -113,7 +114,7 @@ func TestAPIVersionConflictAndPersistFailureDoNotSwap(t *testing.T) {
 
 func TestStartupFallsBackToBackupAndFailOpen(t *testing.T) {
 	p, args := newTestPlugin(t, true)
-	canonical, _, err := canonicalSnapshot(phase3Snapshot(1, 0), p.limits)
+	canonical, _, err := canonicalSnapshot(phase4Snapshot(1, 0), p.limits)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -158,7 +159,7 @@ func TestExecWritesMarksAndRuntimeMetadata(t *testing.T) {
 		SchemaVersion: SchemaVersion, Version: 1, BlockRCode: 3,
 		Rules: []Rule{
 			{ID: 1, Category: CategoryAccess, Action: ActionBlock, MatchType: MatchTypeFull, Pattern: "example.com"},
-			{ID: 2, Category: CategoryRoute, Action: ActionRemote, MatchType: MatchTypeFull, Pattern: "example.com"},
+			{ID: 2, Category: CategoryRoute, Action: ActionUpstream, UpstreamGroupID: "manual_group", MatchType: MatchTypeFull, Pattern: "example.com"},
 			{ID: 3, Category: CategoryLogging, Action: ActionNoLog, MatchType: MatchTypeFull, Pattern: "example.com"},
 		},
 	}, p.limits)
@@ -172,7 +173,8 @@ func TestExecWritesMarksAndRuntimeMetadata(t *testing.T) {
 	if err := p.Exec(t.Context(), qCtx); err != nil {
 		t.Fatal(err)
 	}
-	if !qCtx.HasMark(p.marks.AccessBlock) || !qCtx.HasMark(p.marks.RouteRemote) || !qCtx.HasMark(p.marks.NoLog) {
+	groupID, groupOK := query_context.UpstreamGroupID(qCtx)
+	if !qCtx.HasMark(p.marks.AccessBlock) || !qCtx.HasMark(p.marks.NoLog) || !groupOK || groupID != "manual_group" {
 		t.Fatal("required dynamic rule marks were not written")
 	}
 	decision, ok := RuntimeDecisionFromContext(qCtx)
@@ -181,9 +183,59 @@ func TestExecWritesMarksAndRuntimeMetadata(t *testing.T) {
 	}
 }
 
+func TestExecWritesSubscriptionBinding(t *testing.T) {
+	p, _ := newTestPlugin(t, true)
+	snapshot := testSnapshot()
+	snapshot.SubscriptionSets = []SubscriptionSet{routeBinding(7, 11, "custom_group", 1, "example.com")}
+	compiled, err := Compile(snapshot, p.limits)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.store.Swap(compiled)
+	message := new(dns.Msg)
+	message.SetQuestion("www.example.com.", dns.TypeA)
+	qCtx := query_context.NewContext(message)
+	if err := p.Exec(t.Context(), qCtx); err != nil {
+		t.Fatal(err)
+	}
+	groupID, ok := query_context.UpstreamGroupID(qCtx)
+	decision, decisionOK := RuntimeDecisionFromContext(qCtx)
+	if !ok || groupID != "custom_group" || !decisionOK || decision.RouteSource != "subscription" || decision.BindingID != 11 || decision.UpstreamGroupID != "custom_group" {
+		t.Fatalf("group=%q ok=%t decision=%+v present=%t", groupID, ok, decision, decisionOK)
+	}
+}
+
+func TestBindingCASPersistenceAndMatchAPI(t *testing.T) {
+	p, args := newTestPlugin(t, true)
+	snapshot := testSnapshot()
+	snapshot.SubscriptionSets = []SubscriptionSet{routeBinding(7, 11, "custom_group", 1, "example.com")}
+	if response := apiRequest(t, p, http.MethodPut, "/snapshot", snapshot, "test-token"); response.Code != http.StatusOK {
+		t.Fatalf("apply status = %d: %s", response.Code, response.Body.String())
+	}
+	snapshot.Version = 2
+	snapshot.ExpectedCurrentVersion = 0
+	snapshot.Checksum = ""
+	if response := apiRequest(t, p, http.MethodPut, "/snapshot", snapshot, "test-token"); response.Code != http.StatusConflict {
+		t.Fatalf("stale apply status = %d", response.Code)
+	}
+	data, err := os.ReadFile(args.SnapshotFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	persisted, err := ParseSnapshot(data)
+	if err != nil || len(persisted.SubscriptionSets) != 1 || persisted.SubscriptionSets[0].BindingID != 11 || persisted.SubscriptionSets[0].UpstreamGroupID != "custom_group" || persisted.Checksum == "" {
+		t.Fatalf("persisted snapshot = %+v, err=%v", persisted, err)
+	}
+	response := apiRequest(t, p, http.MethodPost, "/match", matchRequest{QName: "www.example.com"}, "test-token")
+	var matched matchResponse
+	if response.Code != http.StatusOK || json.NewDecoder(response.Body).Decode(&matched) != nil || matched.Route.SubscriptionBindingID != 11 || matched.Route.UpstreamGroupID != "custom_group" || matched.Route.Source != "subscription" {
+		t.Fatalf("match response status=%d value=%+v body=%s", response.Code, matched, response.Body.String())
+	}
+}
+
 func TestConcurrentApplyAndMatch(t *testing.T) {
 	p, _ := newTestPlugin(t, true)
-	if response := apiRequest(t, p, http.MethodPut, "/snapshot", phase3Snapshot(1, 0), "test-token"); response.Code != http.StatusOK {
+	if response := apiRequest(t, p, http.MethodPut, "/snapshot", phase4Snapshot(1, 0), "test-token"); response.Code != http.StatusOK {
 		t.Fatalf("initial apply = %d", response.Code)
 	}
 	var wg sync.WaitGroup
@@ -191,7 +243,7 @@ func TestConcurrentApplyAndMatch(t *testing.T) {
 		wg.Add(1)
 		go func(version uint64) {
 			defer wg.Done()
-			response := apiRequest(t, p, http.MethodPut, "/snapshot", phase3Snapshot(version, 1), "test-token")
+			response := apiRequest(t, p, http.MethodPut, "/snapshot", phase4Snapshot(version, 1), "test-token")
 			if response.Code != http.StatusOK && response.Code != http.StatusConflict {
 				t.Errorf("apply version %d status = %d", version, response.Code)
 			}

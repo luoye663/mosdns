@@ -42,7 +42,7 @@ func BenchmarkCompile100KSubscriptionDomains(b *testing.B) {
 		domains[i] = fmt.Sprintf("%d.example.test", i)
 	}
 	snapshot := testSnapshot()
-	snapshot.SubscriptionSets = []SubscriptionSet{{SourceID: 1, SourceName: "benchmark", Category: CategoryRoute, Action: ActionLocal, Priority: 100, Domains: domains}}
+	snapshot.SubscriptionSets = []SubscriptionSet{{SourceID: 1, SourceName: "benchmark", BindingID: 1, UpstreamGroupID: "benchmark", Category: CategoryRoute, Action: ActionUpstream, Priority: 100, Domains: domains}}
 	b.ReportAllocs()
 	b.ResetTimer()
 	for range b.N {

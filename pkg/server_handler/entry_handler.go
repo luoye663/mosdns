@@ -33,7 +33,7 @@ import (
 )
 
 const (
-	defaultQueryTimeout = time.Second * 5
+	defaultQueryTimeout = time.Second * 35
 )
 
 var (
@@ -101,9 +101,15 @@ func (h *EntryHandler) Handle(ctx context.Context, q *dns.Msg, serverMeta server
 	var resp *dns.Msg
 	if err != nil {
 		h.opts.Logger.Warn("entry err", qCtx.InfoField(), zap.Error(err))
+		if action, ok := query_context.OverloadActionFromContext(qCtx); ok && action == query_context.OverloadDrop {
+			return nil
+		}
 		resp = new(dns.Msg)
 		resp.SetReply(q)
 		resp.Rcode = dns.RcodeServerFailure
+		if action, ok := query_context.OverloadActionFromContext(qCtx); ok && action == query_context.OverloadREFUSED {
+			resp.Rcode = dns.RcodeRefused
+		}
 	} else {
 		resp = qCtx.R()
 	}

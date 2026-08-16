@@ -129,7 +129,7 @@ func (p *Plugin) handleMatch(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, matchResponse{NormalizedQName: result.NormalizedQName, SnapshotVersion: result.SnapshotVersion, Access: matchEffect(result.Access, ""), Route: matchEffect(result.Route, "dynamic_rule"), Logging: matchEffect(result.Logging, "")})
+	writeJSON(w, http.StatusOK, matchResponse{NormalizedQName: result.NormalizedQName, SnapshotVersion: result.SnapshotVersion, Access: matchEffect(result.Access, ""), Route: matchEffect(result.Route, "dynamic_rule"), Logging: matchEffect(result.Logging, ""), Answer: matchEffect(result.Answer, "dynamic_rule")})
 }
 
 func (p *Plugin) decodeSnapshot(r *http.Request) (Snapshot, error) {
@@ -218,13 +218,18 @@ type matchRequest struct {
 }
 
 type matchEffectResponse struct {
-	Decision               string `json:"decision"`
-	RuleID                 int64  `json:"rule_id,omitempty"`
-	MatchType              string `json:"match_type,omitempty"`
-	Pattern                string `json:"pattern,omitempty"`
-	Source                 string `json:"source,omitempty"`
-	SubscriptionSourceID   int64  `json:"subscription_source_id,omitempty"`
-	SubscriptionSourceName string `json:"subscription_source_name,omitempty"`
+	Decision               string   `json:"decision"`
+	RuleID                 int64    `json:"rule_id,omitempty"`
+	MatchType              string   `json:"match_type,omitempty"`
+	Pattern                string   `json:"pattern,omitempty"`
+	Source                 string   `json:"source,omitempty"`
+	SubscriptionSourceID   int64    `json:"subscription_source_id,omitempty"`
+	SubscriptionSourceName string   `json:"subscription_source_name,omitempty"`
+	SubscriptionBindingID  int64    `json:"subscription_binding_id,omitempty"`
+	UpstreamGroupID        string   `json:"upstream_group_id,omitempty"`
+	IPv4Addresses          []string `json:"ipv4_addresses,omitempty"`
+	IPv6Addresses          []string `json:"ipv6_addresses,omitempty"`
+	TTL                    uint32   `json:"ttl,omitempty"`
 }
 
 type matchResponse struct {
@@ -233,6 +238,7 @@ type matchResponse struct {
 	Access          matchEffectResponse `json:"access"`
 	Route           matchEffectResponse `json:"route"`
 	Logging         matchEffectResponse `json:"logging"`
+	Answer          matchEffectResponse `json:"answer"`
 }
 
 func matchEffect(rule MatchedRule, source string) matchEffectResponse {
@@ -242,5 +248,8 @@ func matchEffect(rule MatchedRule, source string) matchEffectResponse {
 		}
 		return matchEffectResponse{Decision: "none"}
 	}
-	return matchEffectResponse{Decision: rule.Action, RuleID: rule.RuleID, MatchType: rule.MatchType, Pattern: rule.Pattern, Source: source, SubscriptionSourceID: rule.SourceID, SubscriptionSourceName: rule.SourceName}
+	if rule.SourceID != 0 {
+		source = "subscription"
+	}
+	return matchEffectResponse{Decision: rule.Action, RuleID: rule.RuleID, MatchType: rule.MatchType, Pattern: rule.Pattern, Source: source, SubscriptionSourceID: rule.SourceID, SubscriptionSourceName: rule.SourceName, SubscriptionBindingID: rule.BindingID, UpstreamGroupID: rule.UpstreamGroupID, IPv4Addresses: rule.IPv4Addresses, IPv6Addresses: rule.IPv6Addresses, TTL: rule.TTL}
 }

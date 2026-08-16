@@ -56,6 +56,85 @@ type Context struct {
 
 var contextUid atomic.Uint32
 
+var (
+	requestedUpstreamGroupKey = RegKey()
+	upstreamRuntimeMetaKey    = RegKey()
+	overloadActionKey         = RegKey()
+	overloadInfoKey           = RegKey()
+)
+
+type OverloadAction string
+
+const (
+	OverloadSERVFAIL OverloadAction = "servfail"
+	OverloadREFUSED  OverloadAction = "refused"
+	OverloadDrop     OverloadAction = "drop"
+)
+
+func SetOverloadAction(ctx *Context, action OverloadAction) {
+	ctx.StoreValue(overloadActionKey, action)
+}
+
+func OverloadActionFromContext(ctx *Context) (OverloadAction, bool) {
+	value, ok := ctx.GetValue(overloadActionKey)
+	action, valid := value.(OverloadAction)
+	return action, ok && valid
+}
+
+type OverloadScope string
+
+const (
+	OverloadScopeGlobal OverloadScope = "global"
+	OverloadScopeGroup  OverloadScope = "group"
+)
+
+type OverloadInfo struct {
+	Scope   OverloadScope
+	GroupID string
+	Limit   int
+}
+
+func SetOverloadInfo(ctx *Context, info OverloadInfo) {
+	ctx.StoreValue(overloadInfoKey, info)
+}
+
+func OverloadInfoFromContext(ctx *Context) (OverloadInfo, bool) {
+	value, ok := ctx.GetValue(overloadInfoKey)
+	info, valid := value.(OverloadInfo)
+	return info, ok && valid
+}
+
+// UpstreamRuntimeMeta describes the runtime route selected for this query.
+type UpstreamRuntimeMeta struct {
+	GroupID     string
+	GroupName   string
+	RouteSource string
+	UpstreamTag string
+	CacheHit    bool
+}
+
+// SetUpstreamGroupID reserves an explicit group selection for later runtime
+// binding by a dynamic rule or route subscription.
+func SetUpstreamGroupID(ctx *Context, groupID string) {
+	ctx.StoreValue(requestedUpstreamGroupKey, groupID)
+}
+
+func UpstreamGroupID(ctx *Context) (string, bool) {
+	value, ok := ctx.GetValue(requestedUpstreamGroupKey)
+	groupID, valid := value.(string)
+	return groupID, ok && valid && groupID != ""
+}
+
+func SetUpstreamRuntimeMeta(ctx *Context, meta UpstreamRuntimeMeta) {
+	ctx.StoreValue(upstreamRuntimeMetaKey, meta)
+}
+
+func UpstreamRuntimeMetaFromContext(ctx *Context) (UpstreamRuntimeMeta, bool) {
+	value, ok := ctx.GetValue(upstreamRuntimeMetaKey)
+	meta, valid := value.(UpstreamRuntimeMeta)
+	return meta, ok && valid
+}
+
 type ServerMeta = server.QueryMeta
 
 // NewContext creates a new query Context.
