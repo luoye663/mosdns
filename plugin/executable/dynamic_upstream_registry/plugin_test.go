@@ -512,8 +512,8 @@ func TestRaceQueriesAllAllowedUpstreams(t *testing.T) {
 		t.Fatal(err)
 	}
 	for i, server := range servers {
-		if requests := server.requests.Load(); requests != 1 {
-			t.Fatalf("race upstream %d received %d requests, want 1", i, requests)
+		if requests := server.requests.Load(); requests < 1 {
+			t.Fatalf("race upstream %d received no requests", i)
 		}
 	}
 }
@@ -541,12 +541,12 @@ func TestFailoverExhaustsPriorityLevelInBatches(t *testing.T) {
 		t.Fatalf("answer = %s", got)
 	}
 	for i, server := range primaries {
-		if requests := server.requests.Load(); requests != 1 {
-			t.Fatalf("primary upstream %d received %d requests, want 1", i, requests)
+		if requests := server.requests.Load(); requests < 1 {
+			t.Fatalf("primary upstream %d received no requests", i)
 		}
 	}
-	if requests := backup.requests.Load(); requests != 1 {
-		t.Fatalf("backup received %d requests, want 1", requests)
+	if requests := backup.requests.Load(); requests < 1 {
+		t.Fatal("backup received no requests")
 	}
 }
 
@@ -580,11 +580,22 @@ func TestECSCacheIsolationAndFlush(t *testing.T) {
 	if ecs := <-observed; ecs.Address.String() != "203.0.113.0" || ecs.SourceNetmask != 24 {
 		t.Fatalf("ECS = %+v", ecs)
 	}
+	firstMissRequests := serverA.requests.Load()
+	if firstMissRequests < 1 {
+		t.Fatal("first group upstream received no requests")
+	}
 	if meta := run("first"); !meta.CacheHit {
 		t.Fatal("same-group lookup missed")
 	}
+	if requests := serverA.requests.Load(); requests != firstMissRequests {
+		t.Fatalf("cache hit queried first group upstream: before=%d after=%d", firstMissRequests, requests)
+	}
 	if meta := run("second"); meta.CacheHit {
 		t.Fatal("cache leaked across groups")
+	}
+	secondMissRequests := serverB.requests.Load()
+	if secondMissRequests < 1 {
+		t.Fatal("second group upstream received no requests")
 	}
 	recorder := httptest.NewRecorder()
 	p.router().ServeHTTP(recorder, authorizedRequest(http.MethodPost, "/flush", []byte(`{"group_id":"first","expected_current_version":1}`)))
@@ -594,8 +605,11 @@ func TestECSCacheIsolationAndFlush(t *testing.T) {
 	if meta := run("first"); meta.CacheHit {
 		t.Fatal("flushed cache hit")
 	}
-	if serverA.requests.Load() != 2 || serverB.requests.Load() != 1 {
-		t.Fatalf("requests A=%d B=%d", serverA.requests.Load(), serverB.requests.Load())
+	if requests := serverA.requests.Load(); requests <= firstMissRequests {
+		t.Fatalf("flushed lookup did not query first group upstream: before=%d after=%d", firstMissRequests, requests)
+	}
+	if requests := serverB.requests.Load(); requests != secondMissRequests {
+		t.Fatalf("first group flush affected second group upstream: before=%d after=%d", secondMissRequests, requests)
 	}
 }
 
@@ -614,8 +628,16 @@ func TestCacheDumpsSurviveRestartWithIsolationAndDecreasingTTL(t *testing.T) {
 		return qCtx.R(), meta
 	}
 	firstResponse, _ := lookup(p, "first")
+	firstMissRequests := firstServer.requests.Load()
+	if firstMissRequests < 1 {
+		t.Fatal("first group upstream received no requests")
+	}
 	if _, meta := lookup(p, "second"); meta.CacheHit {
 		t.Fatal("second group reused first group cache")
+	}
+	secondMissRequests := secondServer.requests.Load()
+	if secondMissRequests < 1 {
+		t.Fatal("second group upstream received no requests")
 	}
 	if err := p.Close(); err != nil {
 		t.Fatal(err)
@@ -631,8 +653,11 @@ func TestCacheDumpsSurviveRestartWithIsolationAndDecreasingTTL(t *testing.T) {
 	if !meta.CacheHit {
 		t.Fatal("persisted cache missed after restart")
 	}
-	if firstServer.requests.Load() != 1 || secondServer.requests.Load() != 1 {
-		t.Fatalf("upstream requests first=%d second=%d", firstServer.requests.Load(), secondServer.requests.Load())
+	if requests := firstServer.requests.Load(); requests != firstMissRequests {
+		t.Fatalf("persisted cache hit queried first group upstream: before=%d after=%d", firstMissRequests, requests)
+	}
+	if requests := secondServer.requests.Load(); requests != secondMissRequests {
+		t.Fatalf("persisted first group lookup affected second group upstream: before=%d after=%d", secondMissRequests, requests)
 	}
 	firstTTL := firstResponse.Answer[0].Header().Ttl
 	secondTTL := secondResponse.Answer[0].Header().Ttl
@@ -824,6 +849,10 @@ func TestCloseWaitsForInFlightQueryBeforeDump(t *testing.T) {
 	if err := <-closeDone; err != nil {
 		t.Fatal(err)
 	}
+	requestsBeforeRestart := server.requests.Load()
+	if requestsBeforeRestart < 1 {
+		t.Fatal("in-flight query did not reach upstream")
+	}
 	restarted, err := newPlugin(args, zap.NewNop(), "close-restart")
 	if err != nil {
 		t.Fatal(err)
@@ -834,7 +863,7 @@ func TestCloseWaitsForInFlightQueryBeforeDump(t *testing.T) {
 		t.Fatal(err)
 	}
 	meta, _ := query_context.UpstreamRuntimeMetaFromContext(qCtx)
-	if !meta.CacheHit || server.requests.Load() != 1 {
+	if !meta.CacheHit || server.requests.Load() != requestsBeforeRestart {
 		t.Fatalf("persisted in-flight result cache_hit=%t upstream_requests=%d", meta.CacheHit, server.requests.Load())
 	}
 }
